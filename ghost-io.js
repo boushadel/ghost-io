@@ -60,7 +60,7 @@ function clampNum(v, min, max, fallback) {
 }
 
 // ============================================================================
-// [WORKER SECTION 2] D1 & KV API ENDPOINT HANDLERS
+// [WORKER SECTION 2] D1 & KV API ENDPOINT HANDLPERS
 // Purpose: Implements /api/auth, /api/me, /api/leaderboards, /api/match,
 // /api/report (ELO + rich DNA ghost saving), and /api/ghosts/manage.
 // ============================================================================
@@ -1207,10 +1207,12 @@ function scoreMove(e, c, isPreferred){
   if (wd <= 4) sc += ((e.wallPref != null ? e.wallPref : 0.35) - 0.35) * 8;
   if (owner[idx] > 0 && owner[idx] !== e.id) sc += ((e.stealPref != null ? e.stealPref : 0.3) - 0.3) * 8;
 
+  // Natural straight-line momentum prevents aimless 90-degree spinning when prefs is empty
   var rel = (c - e.d + 4) % 4;
+  if (rel === 0) sc += 2.0;
   var bias = e.spinBias != null ? e.spinBias : 0;
-  if (rel === 1) sc += bias * 2.5;
-  else if (rel === 3) sc -= bias * 2.5;
+  if (rel === 1) sc += bias * 0.6;
+  else if (rel === 3) sc -= bias * 0.6;
 
   return sc;
 }
@@ -1238,7 +1240,7 @@ function ghostDecide(e){
     target = h; e.tpl = null; e.ret = true; e.goal = -1; reason = 'hunt';
   } else if (e.ret){
     target = safestOwn(e); reason = 'retreat';
-  } else if (!out && e.idle > (e.model ? 32 : 14)){
+  } else if (!out && e.idle > 12){
     if (e.goal < 0 || owner[e.goal] === e.id) e.goal = pickGoal(e);
     target = e.goal; reason = 'goal';
   } else {
@@ -1264,7 +1266,7 @@ function ghostDecide(e){
       c = goTo(e, target);
       if (c >= 0) prefs = [c];
     }
-  } else if (!prefs.length && !(e.model && e.trips && e.trips.length)){
+  } else if (!prefs.length && !(out && e.model && e.trips && e.trips.length)){
     if (e.model){
       reason = 'policy';
       c = policy(e);
