@@ -1,17 +1,82 @@
 // ============================================================================
-// Ghost.io — Full-Stack Cloudflare Worker (D1 + KV + Deep Behavioral Cloning)
-// Architecture:
-//   - Backend: Cloudflare Worker handling Auth, ELO Matchmaking, Ghost Roster,
-//     Leaderboards, and Offline Battle Reports using D1 (SQL) + KV (JSON brains).
-//   - Frontend: Single-file mobile-first canvas game with 9 modular sections.
-// Deploy command: npx wrangler deploy
+// GHOST.IO — FULL-STACK CLOUDFLARE WORKER (D1 + KV + DEEP BEHAVIORAL CLONING)
+// ============================================================================
+//
+// [A] AI & DEVELOPER GOVERNANCE RULES (MANDATORY FOR ANY AI EDITING THIS FILE)
+// ----------------------------------------------------------------------------
+//   1. MANDATORY RATIONALE FOR EVERY EDIT (`FIX RATIONALE:` / `CHANGE REASON:`):
+//      - Whenever you add, modify, or fix ANY code in this file, you MUST write
+//        an inline comment directly above the changed lines explaining:
+//          (a) WHAT symptom/bug or requirement triggered the change, and
+//          (b) WHY this specific implementation solves it.
+//      - NEVER delete, overwrite, or revert existing `FIX RATIONALE:` blocks
+//        unless you have verified that the original bug cannot reoccur.
+//   2. PERSISTENT DEVELOPER MANDATES REGISTRY (SECTION [B] BELOW):
+//      - Whenever the developer (user) specifies a new core rule, architectural
+//        constraint, gameplay behavior, or diagnostic requirement, you MUST
+//        append it to Section [B] (`DEVELOPER MANDATES & CORE RULES`) in this
+//        header so every future AI assistant sees all accumulated rules without
+//        needing them repeated in future prompts.
+//   3. COMPLETE SELF-EXPLANATORY DOCUMENTATION:
+//      - Keep all section banners, JSDoc function headers, and complex algorithm
+//        explanations thorough and up-to-date in clear technical English.
+//
+// [B] DEVELOPER MANDATES & CORE RULES (ACCUMULATED PROJECT REQUIREMENTS)
+// ----------------------------------------------------------------------------
+//   - [RULE-01] Every code edit or bug fix must include an inline `FIX RATIONALE:`
+//               comment explaining why it was added so future edits stay safe.
+//   - [RULE-02] All core rules and major feature requests from the developer
+//               must be recorded here inside the source file itself.
+//   - [RULE-03] Keep the `[DEV-LOG START] ... [DEV-LOG END]` telemetry system,
+//               the HUD instant-copy button (`📋`), and end-of-round/pause copy
+//               buttons active until the developer explicitly asks to remove them.
+//   - [RULE-04] Strict Account Isolation: Authenticated users must NEVER have
+//               `Local#` localStorage ghosts injected into their matches (only
+//               cloud D1/KV ghosts or clean `BOT-N` fillers). localStorage runs
+//               are strictly restricted to unauthenticated Guest sessions.
+//   - [RULE-05] Single-File Cloudflare Worker Architecture: Keep the entire D1/KV
+//               backend API and mobile-first HTML5 Canvas client self-contained
+//               in `ghost-io.js` for zero-build `npx wrangler deploy`.
+//   - [RULE-06] Zero Backticks (`) inside `const HTML = String.raw`...`;` so the
+//               embedded frontend template literal never terminates prematurely.
+//
+// [C] SYSTEM ARCHITECTURE & DATABASE SCHEMA REFERENCE
+// ----------------------------------------------------------------------------
+//   1. Backend (Cloudflare Worker):
+//      - Serves the single-file mobile-first HTML5 game at `/`.
+//      - Exposes REST JSON endpoints under `/api/*` backed by Cloudflare D1
+//        (relational SQL for accounts, ghost metadata, ELO, and battle logs)
+//        and Cloudflare KV (key-value store for serialized behavioral brains).
+//   2. Frontend (Embedded Single-Page Canvas Game):
+//      - Real-time 80x80 grid territory-capture game (Paper.io mechanics).
+//      - Observes human player decisions every tick to extract a 5-level
+//        hierarchical context-action probability model, geometric loop shapes
+//        ("trips"), and 6 high-level behavioral DNA traits.
+//      - Clones player behavior into autonomous AI ghosts that fight other
+//        players asynchronously while the owner is offline.
+//   3. Cloudflare D1 Tables:
+//      - users(id, username, username_lower, pass_hash, salt, token, peak, kills, wins, games, elo, created_at)
+//      - ghosts(id, user_id, owner_name, slot_num, badge, peak, aggr, caut, max_trail, elo, kills, matches, wins, locked, kv_key, created_at)
+//      - battle_logs(id, owner_user_id, ghost_label, challenger_name, ghost_kills, ghost_won, elo_delta, seen, created_at)
+//   4. Core Engine Invariants:
+//      - `ents[0]` is ALWAYS the human player (`id = 1`); AI ghosts occupy `id = 2..5`.
+//      - Grid buffers (`owner`, `trail`) store 1-based entity IDs (`0` = neutral/empty).
+//
+// DEPLOY COMMAND: npx wrangler deploy
 // ============================================================================
 
+
 // ============================================================================
-// [WORKER SECTION 1] CRYPTO, AUTH & VALIDATION HELPERS
-// Purpose: Password hashing (Web Crypto SHA-256 + salt), secure session tokens,
-// multi-trait DNA badge classification, and JSON HTTP response helpers.
+// [WORKER SECTION 1] CRYPTOGRAPHY, AUTHENTICATION & DNA CLASSIFICATION HELPERS
+// Purpose: Provides stateless JSON response builders, Web Crypto token/password
+// hashing, Bearer token session resolution, input sanitization, and automatic
+// archetype badge assignment based on a player's extracted 6-axis Style DNA.
 // ============================================================================
+
+/**
+ * Wraps any plain JS object into an HTTP Response with UTF-8 JSON headers
+ * and `no-store` caching so live matchmaking/ELO data is never stale.
+ */
 function jsonRes(data, status = 200) {
   return new Response(JSON.stringify(data), {
     status,
@@ -22,18 +87,30 @@ function jsonRes(data, status = 200) {
   });
 }
 
+/**
+ * Generates a cryptographically secure random hexadecimal string.
+ * Used for per-user password salts, session Bearer tokens, and unique KV keys.
+ */
 function randomHex(bytes = 16) {
   const arr = new Uint8Array(bytes);
   crypto.getRandomValues(arr);
   return Array.from(arr, (b) => b.toString(16).padStart(2, "0")).join("");
 }
 
+/**
+ * Computes a salted SHA-256 hex digest using the Web Crypto API.
+ * Salt is prepended (`salt:password`) to prevent rainbow-table lookups.
+ */
 async function hashPassword(password, salt) {
   const enc = new TextEncoder().encode(salt + ":" + password);
   const buf = await crypto.subtle.digest("SHA-256", enc);
   return Array.from(new Uint8Array(buf), (b) => b.toString(16).padStart(2, "0")).join("");
 }
 
+/**
+ * Resolves the authenticated user row from the `Authorization: Bearer <token>` header.
+ * Returns `null` if missing, malformed, or unmatched in D1 (guest session).
+ */
 async function getAuthUser(request, env) {
   const auth = request.headers.get("Authorization") || "";
   const token = auth.startsWith("Bearer ") ? auth.slice(7).trim() : "";
@@ -43,27 +120,49 @@ async function getAuthUser(request, env) {
   ).bind(token).first();
 }
 
+/**
+ * Assigns a human-readable archetype badge to a cloned ghost based on its
+ * dominant behavioral traits recorded during the human player's round.
+ * Evaluated in priority order from most specialized combat/expansion style
+ * down to the general-purpose "Phantom" fallback.
+ */
 function classifyGhostBadge(aggr, caut, maxTrail, stealPref, wallPref, defendPref) {
-  if (aggr >= 0.68) return "🗡️ Hunter";
-  if (stealPref >= 0.55) return "🏴‍☠️ Raider";
-  if (defendPref >= 0.68) return "🏰 Warden";
-  if (wallPref >= 0.68) return "🧱 Wall-Hugger";
-  if (caut >= 0.68 && maxTrail <= 26) return "🛡️ Defender";
-  if (maxTrail >= 42) return "👑 Greedy";
-  return "👻 Phantom";
+  if (aggr >= 0.68) return "🗡️ Hunter";       // Frequently chases & cuts rival trails
+  if (stealPref >= 0.55) return "🏴‍☠️ Raider";   // Prefers carving territory directly from rivals
+  if (defendPref >= 0.68) return "🏰 Warden";    // Aggressively intercepts intruders inside home land
+  if (wallPref >= 0.68) return "🧱 Wall-Hugger"; // Hugs outer arena borders for safe expansion
+  if (caut >= 0.68 && maxTrail <= 26) return "🛡️ Defender"; // Short loops, retreats early on threat
+  if (maxTrail >= 42) return "👑 Greedy";        // Takes huge, risky high-reward loops
+  return "👻 Phantom";                           // Balanced / adaptive playstyle
 }
 
+/**
+ * Safely coerces client-submitted telemetry numbers into bounded finite values
+ * to prevent NaN/Infinity or out-of-range payloads from corrupting D1/KV.
+ */
 function clampNum(v, min, max, fallback) {
   const n = Number(v);
   if (!Number.isFinite(n)) return fallback;
   return Math.max(min, Math.min(max, n));
 }
 
+
 // ============================================================================
-// [WORKER SECTION 2] D1 & KV API ENDPOINT HANDLERS
-// Purpose: Implements /api/auth, /api/me, /api/leaderboards, /api/match,
-// /api/report (ELO + rich DNA ghost saving), and /api/ghosts/manage.
+// [WORKER SECTION 2] CLOUDFLARE D1 & KV API ENDPOINT HANDLERS
+// Purpose: Implements all backend REST routes:
+//   - POST /api/auth          : Account registration & login with token rotation
+//   - GET  /api/me            : Session restore, ghost roster, & offline battle report
+//   - GET  /api/leaderboards  : Global top 15 players & top 15 ghosts by ELO
+//   - POST /api/match         : Matchmaking & parallel KV brain hydration
+//   - POST /api/report        : Post-match ELO calculation & 5-slot ghost persistence
+//   - POST /api/ghosts/manage : Lock/unlock or delete owned ghost slots
 // ============================================================================
+
+/**
+ * Handles both `register` and `login` modes.
+ * Enforces 3-14 alphanumeric/underscore usernames and case-insensitive uniqueness
+ * via `username_lower` while preserving original display casing in `username`.
+ */
 async function handleAuth(request, env) {
   let body;
   try { body = await request.json(); } catch { return jsonRes({ ok: false, error: "Invalid JSON" }, 400); }
@@ -107,6 +206,7 @@ async function handleAuth(request, env) {
     if (checkHash !== existing.pass_hash) {
       return jsonRes({ ok: false, error: "Incorrect password" }, 401);
     }
+    // Rotate session token on every login
     const token = randomHex(24);
     await env.DB.prepare("UPDATE users SET token = ? WHERE id = ?").bind(token, existing.id).run();
     return jsonRes({
@@ -125,6 +225,11 @@ async function handleAuth(request, env) {
   }
 }
 
+/**
+ * Restores the current user's profile, their up-to-5 saved ghosts, and any
+ * unseen asynchronous battles fought by their ghosts while offline.
+ * Automatically marks fetched `battle_logs` as `seen = 1` so the popup shows once.
+ */
 async function handleMe(request, env) {
   const user = await getAuthUser(request, env);
   if (!user) return jsonRes({ ok: false, error: "Unauthorized" }, 401);
@@ -155,7 +260,7 @@ async function handleMe(request, env) {
       kills: totalKills,
       wins,
       netElo,
-      logs: unseen.slice(0, 6),
+      logs: unseen.slice(0, 6), // Send top 6 recent entries for compact UI display
     };
   }
 
@@ -167,6 +272,9 @@ async function handleMe(request, env) {
   });
 }
 
+/**
+ * Fetches global Top 15 Players and Top 15 Ghosts ordered by ELO rating.
+ */
 async function handleLeaderboards(env) {
   const playersRes = await env.DB.prepare(
     "SELECT username, elo, peak, kills, wins, games FROM users ORDER BY elo DESC, peak DESC LIMIT 15"
@@ -183,12 +291,22 @@ async function handleLeaderboards(env) {
   });
 }
 
+/**
+ * Selects up to 4 rival ghosts from D1 based on the requested game mode, then
+ * hydrates each ghost's full neural/context model & trip templates from KV in parallel.
+ * Modes:
+ *   - 'mine'   : Practice against the logged-in user's own saved ghosts.
+ *   - 'friend' : Challenge up to 4 ghosts belonging to a specific username.
+ *   - 'ghost'  : Leaderboard revenge mode; guarantees target `ghostId` + up to 3
+ *                teammates from the same owner, backfilled with random global ghosts.
+ *   - 'others' : Standard ranked matchmaking against random ghosts from other users.
+ */
 async function handleMatch(request, env) {
   let body = {};
   try { body = await request.json(); } catch {}
 
   const user = await getAuthUser(request, env);
-  const mode = body.mode || "others"; // 'others' | 'mine' | 'friend' | 'ghost'
+  const mode = body.mode || "others";
   let rows = [];
 
   if (mode === "mine") {
@@ -266,6 +384,16 @@ async function handleMatch(request, env) {
   return jsonRes({ ok: true, ghosts: hydrated });
 }
 
+/**
+ * Processes end-of-round results in 3 transactional steps:
+ *   1. Updates ELO & match counters for each rival D1 ghost (when `ranked = true`,
+ *      ignoring any ghost owned by the challenger to prevent self-boosting) and
+ *      inserts an unseen `battle_logs` entry for each ghost's owner.
+ *   2. Updates the authenticated player's ELO rating, peak territory, and career stats.
+ *   3. If the player made >= 40 decisions (`ns >= 40`), saves their newly trained
+ *      behavioral model & trips to KV and registers a new ghost slot in D1 (max 5
+ *      slots; automatically evicts the lowest-ELO unlocked ghost when full).
+ */
 async function handleReport(request, env) {
   let body;
   try { body = await request.json(); } catch { return jsonRes({ ok: false, error: "Invalid JSON" }, 400); }
@@ -292,7 +420,7 @@ async function handleReport(request, env) {
   const challengerElo = user ? user.elo : 1000;
   const challengerId = user ? user.id : -1;
 
-  // 1. Update ELO ratings & offline battle logs for rival D1 ghosts
+  // Step 1: Update ELO ratings & offline battle logs for rival D1 ghosts
   let oppEloSum = 0, oppCount = 0;
   const eloUpdates = [];
 
@@ -312,6 +440,7 @@ async function handleReport(request, env) {
       const killedByPlayer = Math.round(clampNum(opp.killedByPlayer, 0, 10, 0));
       const oppPeak = clampNum(opp.peak, 0, 100, 0);
 
+      // Performance score for ELO: 1.0 if ghost killed player, 0.75 if ghost out-peaked losing player, 0.0 if beaten
       let ghostScore = 0.4;
       if (killsByGhost > 0) ghostScore = 1.0;
       else if (!won && oppPeak > peak) ghostScore = 0.75;
@@ -337,7 +466,7 @@ async function handleReport(request, env) {
     }
   }
 
-  // 2. Update Player ELO & Stats (if logged in)
+  // Step 2: Update Player ELO & Career Stats (if logged in)
   let playerDelta = 0;
   let updatedUser = user;
   if (user) {
@@ -365,12 +494,13 @@ async function handleReport(request, env) {
     };
   }
 
-  // 3. Save Player's New Ghost to D1 + KV (if logged in and run had >= 40 decisions)
+  // Step 3: Save Player's New Ghost to D1 + KV (max 5 slots per user)
   let ghostSaved = false;
   let ghostMsg = "";
   const badge = classifyGhostBadge(aggr, caut, maxTrail, stealPref, wallPref, defendPref);
 
   if (user && ns >= 40 && round.model) {
+    // Query ordered by `locked ASC, elo ASC` so the first row is the best candidate for eviction
     const existingRes = await env.DB.prepare(
       "SELECT id, slot_num, elo, locked, kv_key FROM ghosts WHERE user_id = ? ORDER BY locked ASC, elo ASC, id ASC"
     ).bind(user.id).all();
@@ -430,6 +560,10 @@ async function handleReport(request, env) {
   });
 }
 
+/**
+ * Allows an authenticated user to toggle the protection lock (`locked = 0|1`)
+ * or permanently delete one of their own ghost slots (cleaning up both D1 & KV).
+ */
 async function handleManageGhost(request, env) {
   const user = await getAuthUser(request, env);
   if (!user) return jsonRes({ ok: false, error: "Unauthorized" }, 401);
@@ -459,9 +593,11 @@ async function handleManageGhost(request, env) {
   return jsonRes({ ok: false, error: "Unknown action" }, 400);
 }
 
+
 // ============================================================================
 // CLIENT GAME HTML & ENGINE (MOBILE-FIRST PAPER.IO + DEEP BEHAVIORAL CLONING)
-// Note: Zero backticks are used inside HTML template string to prevent early termination.
+// [RULE-06] CRITICAL INVARIANT: Do NOT place any backtick character (`)
+// anywhere inside this String.raw template literal.
 // ============================================================================
 const HTML = String.raw`<!doctype html>
 <html lang="en">
@@ -472,7 +608,7 @@ const HTML = String.raw`<!doctype html>
 <meta name="apple-mobile-web-app-capable" content="yes">
 <title>Ghost.io</title>
 <style>
-  /* Full-viewport mobile-first layout; disables pull-to-refresh, selection, and scrolling */
+  /* Full-viewport mobile-first layout; disables pull-to-refresh, text selection, and scrolling */
   html,body{margin:0;height:100%;width:100%;position:fixed;background:#0f1220;color:#e8ebff;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;overflow:hidden;overscroll-behavior:none;touch-action:none;-webkit-user-select:none;user-select:none;-webkit-touch-callout:none;-webkit-tap-highlight-color:transparent}
   #wrap{display:flex;flex-direction:column;height:100%;height:100dvh;box-sizing:border-box;padding:env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left)}
   #hud{display:flex;gap:4px;padding:0 6px;font-size:11px;align-items:center;height:32px;flex:none;overflow:hidden}
@@ -525,59 +661,67 @@ const HTML = String.raw`<!doctype html>
 
 // ============================================================================
 // [SECTION 1] GAME CONFIGURATION & CONSTANTS
-// Purpose: Defines core game parameters (directions, palette, arena dimensions,
-// tick rate, lives, and ML sample thresholds). Modify here to tune balance.
+// Purpose: Centralizes core simulation constants, direction vectors, color
+// palettes, tick frequency, and machine-learning confidence thresholds.
 // ============================================================================
-var DX = [1, 0, -1, 0], DY = [0, 1, 0, -1]; // Direction vectors: 0=right, 1=down, 2=left, 3=up
-var COLORS = ['#4da3ff','#ff5d73','#ffc14d','#59e0a0','#c58bff','#ff8f5a','#5ad7e6']; // Entity color palette
+// Cardinal direction vectors: index 0=Right (+x), 1=Down (+y), 2=Left (-x), 3=Up (-y).
+// Turning right (CW) is `(d + 1) % 4`; turning left (CCW) is `(d + 3) % 4`; U-turn is `(d + 2) % 4`.
+var DX = [1, 0, -1, 0], DY = [0, 1, 0, -1];
+
+// Distinct neon palette for up to 7 entities; pre-parsed to RGB tuples for fast ImageData minimap writes
+var COLORS = ['#4da3ff','#ff5d73','#ffc14d','#59e0a0','#c58bff','#ff8f5a','#5ad7e6'];
 var CRGB = COLORS.map(function(h){ return [parseInt(h.substr(1,2),16), parseInt(h.substr(3,2),16), parseInt(h.substr(5,2),16)]; });
 var WALL = '#ff2bd6', OUTSIDE = '#0a0b16', FLOOR = '#161a30';
-var TICK_MS = 100;               // Logic update interval in ms (10 ticks/sec)
-var LIVES = 3;                   // Player lives per round
-var MINS = 6;                    // Minimum samples required in a context bucket before a ghost trusts it
-var KEY = 'ghostio_runs_v2';     // localStorage key for offline/guest fallback ghost runs
-var AUTH_KEY = 'ghostio_tok_v1'; // localStorage key for persisted login session token
-var W = 80, H = 80, N = W * H;   // Fixed arena grid size in cells (80x80 = 6400 cells)
+
+var TICK_MS = 100;               // Fixed simulation step interval (100ms = 10 logic ticks/sec; decoupled from render FPS)
+var LIVES = 3;                   // Total lives per round for the human player (rivals respawn indefinitely until out of room)
+var MINS = 6;                    // Minimum observed samples in a context bucket before a ghost trusts that specific bucket
+var KEY = 'ghostio_runs_v2';     // localStorage key storing offline/guest ghost models
+var AUTH_KEY = 'ghostio_tok_v1'; // localStorage key storing persisted Bearer session token
+var W = 80, H = 80, N = W * H;   // Arena grid dimensions (80x80 = 6,400 cells)
 
 
 // ============================================================================
-// [SECTION 2] GLOBAL GAME STATE & DOM REFERENCES
-// Purpose: Holds mutable runtime state, grid buffers, active entities, and
-// cloud session state (logged-in user, selected match mode, offline report).
+// [SECTION 2] GLOBAL GAME STATE, GRID BUFFERS & DIAGNOSTIC LOGGER
+// Purpose: Holds mutable round state, flat TypedArray grid buffers for O(1)
+// cell lookups, cloud session cache, and the persistent Dev Log system.
 // ============================================================================
 var cv = document.getElementById('cv'), ctx = cv.getContext('2d');
 var chipsEl = document.getElementById('chips'), timeEl = document.getElementById('time');
 var ov = document.getElementById('ov'), card = document.getElementById('card'), stage = document.getElementById('stage');
 
-// Offscreen 1:1 pixel canvas for the minimap (redrawn via ImageData every tick)
+// Offscreen 80x80 1:1 pixel buffer for the minimap; updated via direct Uint8ClampedArray writes each tick
 var mini = document.createElement('canvas'); mini.width = W; mini.height = H;
 var mctx = mini.getContext('2d'), mimg = mctx.createImageData(W, H);
 
-var owner;          // Uint8Array(N): stores entity ID owning each cell (0 = neutral)
-var trail;          // Uint8Array(N): stores entity ID of active trail in each cell (0 = none)
-var ents = [];      // Array of all active entities in the current round (index 0 is always player)
-var player = null;  // Direct reference to the human player entity
-var tick = 0;       // Logic step counter since round start
-var running = false;// Game loop active flag
-var cell = 16;      // Dynamic pixel size of one grid cell (scaled on resize)
+var owner;          // Uint8Array(6400): stores 1-based entity ID owning each cell (0 = neutral floor)
+var trail;          // Uint8Array(6400): stores 1-based entity ID of active exposed trail in each cell (0 = none)
+var ents = [];      // Active entity list; ents[0] is always the human player (id=1), ents[1..4] are AI ghosts/bots
+var player = null;  // Direct pointer to ents[0]
+var tick = 0;       // Monotonic simulation tick counter for the current round
+var running = false;// True while the simulation & animation loop are active
+var cell = 16;      // Dynamic pixel size of 1 grid cell, recalculated on viewport resize
 var dpr = 1, cw = 0, ch = 0;
-var q = [];         // Input turn queue (max 2 buffered turns)
+var q = [];         // Buffered turn queue (max 2 inputs) so rapid two-finger/quick swipes execute cleanly on consecutive ticks
 var tripSum = 0, tripN = 0, trips = [];
 var last = 0, acc = 0;
 var toast = { msg: '', until: 0 };
 
-// Cloud account & matchmaking state
+// Cloud account & matchmaking session state
 var authToken = '';
 try { authToken = localStorage.getItem(AUTH_KEY) || ''; } catch(e) {}
-var currentUser = null;     // Logged-in user object { id, username, elo, peak, kills, wins, games }
-var myCloudGhosts = [];     // User's up-to-5 ghosts stored in D1
-var offlineReport = null;   // Unseen battle report summary fetched on login/open
-var gameMode = 'others';    // 'others' | 'mine' | 'friend' | 'ghost'
-var friendQuery = '';       // Friend username for 'friend' mode
-var challengeGhostId = 0;   // Specific ghost DB ID for 'ghost' (Revenge) mode
-var lastMatchConfig = null; // Stores parameters for instant "Play Again"
+var currentUser = null;     // Authenticated user object { id, username, elo, peak, kills, wins, games }
+var myCloudGhosts = [];     // User's up-to-5 ghosts fetched from D1
+var offlineReport = null;   // Unseen offline battle summary fetched on login/boot
+var gameMode = 'others';    // Selected matchmaking mode: 'others' | 'mine' | 'friend' | 'ghost'
+var friendQuery = '';       // Username entered in 'friend' challenge mode
+var challengeGhostId = 0;   // Target ghost DB ID when challenging from Leaderboards
+var lastMatchConfig = null; // Preserves match parameters for instant "Play again"
 
-// [DEV-LOG START] Comprehensive diagnostic logger for active development
+// [DEV-LOG START] [RULE-03] Comprehensive diagnostic ring-buffer logger
+// FIX RATIONALE: Added persistent telemetry ring-buffer and instant HUD/modal copy
+// buttons so mobile gameplay bugs (spinning, stalling, spawn failures) can be
+// diagnosed from exact tick-by-tick logs without needing desktop DevTools.
 var devLogs = [];
 function dlog(msg){
   if (devLogs.length >= 800) devLogs.shift();
@@ -597,6 +741,7 @@ function copyDevLog(btnEl){
   } else {
     fallbackCopy();
   }
+  // Fallback copy via hidden textarea for mobile WebViews that block async Clipboard API
   function fallbackCopy(){
     var ta = document.createElement('textarea');
     ta.value = text;
@@ -626,9 +771,10 @@ function esc(s){
 
 
 // ============================================================================
-// [SECTION 3] API CLIENT, AUTH & GHOST REPOSITORY
-// Purpose: Communicates with Cloudflare Worker endpoints (/api/*) for login,
-// matchmaking, leaderboards, and ELO reporting, with localStorage fallback.
+// [SECTION 3] API CLIENT, SESSION SYNC & LOCAL GHOST REPOSITORY
+// Purpose: Wraps `fetch` with automatic Bearer authentication, manages local
+// offline fallback runs for guest users, and prunes low-confidence buckets
+// before uploading trained behavioral models to Cloudflare KV.
 // ============================================================================
 function apiFetch(path, opts){
   opts = opts || {};
@@ -661,6 +807,10 @@ function saveLocalRuns(r){
   try { localStorage.setItem(KEY, JSON.stringify(r)); } catch(e) {}
 }
 
+/**
+ * Generates a simple procedural step-turn script for standard fallback `BOT-N`
+ * entities when fewer than 4 real player ghosts are available.
+ */
 function genDefault(){
   var s = Math.random() < 0.5 ? 1 : 3, out = [];
   for (var i = 0; i < 40; i++){
@@ -669,6 +819,10 @@ function genDefault(){
   return out;
 }
 
+/**
+ * Selects up to 4 local runs for Guest "My Ghosts" practice mode:
+ * top 3 highest peak territory runs + the single most recent run.
+ */
 function pickLocalGhosts(store){
   var runs = store.runs.slice(), out = [], i;
   var best = runs.slice().sort(function(a, b){ return b.peak - a.peak; });
@@ -682,6 +836,11 @@ function pickLocalGhosts(store){
   return out;
 }
 
+/**
+ * Compresses a player's context-action table before KV serialization by
+ * discarding fine-grained buckets with fewer than `MINS` (6) observations,
+ * while always preserving level-4 (`40`/`41`) global fallback buckets.
+ */
 function pruneModel(m){
   var o = {}, k, c;
   for (k in m){
@@ -691,6 +850,10 @@ function pruneModel(m){
   return o;
 }
 
+/**
+ * Validates the stored Bearer token against `/api/me` and refreshes
+ * `currentUser`, `myCloudGhosts`, and any unseen `offlineReport`.
+ */
 function refreshSession(){
   if (!authToken){
     currentUser = null;
@@ -712,35 +875,42 @@ function refreshSession(){
 
 
 // ============================================================================
-// [SECTION 4] ENTITY MANAGEMENT, SPAWNING & DEATH
-// Purpose: Handles entity instantiation, spatial search for safe spawn zones,
-// territory initialization, and elimination/land-transfer mechanics.
+// [SECTION 4] ENTITY MANAGEMENT, SPAWNING & ELIMINATION
+// Purpose: Creates entity state objects, scans the 80x80 grid for safe empty
+// 3x3 spawn locations away from rivals, and handles death/territory transfer.
 // ============================================================================
 function mk(id, name, isPlayer){
   return {
     id: id, name: name, isPlayer: isPlayer, color: COLORS[id - 1],
+    // Grid coordinates: (x, y) is current cell; (px, py) is previous cell for smooth sub-tick rendering
     x: 0, y: 0, px: 0, py: 0, d: 0, alive: false,
     trail: [], exit: -1, respawn: 0, kills: 0, pct: 0, peak: 0, deaths: 0, wait: 0,
-    // Cloud metadata & combat telemetry for ELO:
+    // Cloud metadata & combat telemetry for ELO calculation:
     dbId: 0, badge: '', elo: 1000, killsOnPlayer: 0, killedByPlayer: 0,
-    // Multi-dimensional Behavioral Cloning DNA traits:
+    // 6-axis Behavioral Cloning DNA traits (loaded from KV for ghosts, or default for bots):
     script: null, si: 0, sc: 0, maxTrail: 20, aggr: 0.4, caut: 0.3,
     wallPref: 0.35, stealPref: 0.3, spinBias: 0, defendPref: 0.5, uturnRate: 0.03,
-    // Telemetry counters recorded during player gameplay:
+    // Real-time player telemetry accumulators (recorded only when isPlayer === true):
     idle: 0, goal: -1, since: 0, pend: -1, model: null, ns: 0,
     chT: 0, chA: 0, fT: 0, fA: 0,
     wallTicks: 0, totalTicks: 0, stealSteps: 0, neutralSteps: 0,
     rightTurns: 0, leftTurns: 0, uturns: 0, defT: 0, defA: 0,
-    // Trip shape recorder & playback state:
+    // Geometric loop ("trip") recorder & playback state:
     trips: null, tpl: null, ti: 0, tc: 0, ret: false, tripOn: false,
     tseg: [], tp0: 0, tlist: [], tHunt: false, tripWall: 0, tripSteal: 0, tripSteps: 0,
+    // FIX RATIONALE: Tracks last turn action chosen by `policy()` inside home land to prevent 2x2 self-loops
     lastPolicyAct: 0,
-    // [DEV-LOG START] Per-entity diagnostic tracking
+    // [DEV-LOG START] Per-entity diagnostic state trackers
     turnHist: [], lastReason: 'init', prevReason: 'init', spinWarnedTick: -99, wallStall: 0
     // [DEV-LOG END]
   };
 }
 
+/**
+ * Scans the arena for candidate spawn centers `(x, y)` where:
+ *   1. A `(2*rad + 1)^2` square around `(x, y)` has zero owned cells and zero trails.
+ *   2. Every living rival head is at least `dist` Manhattan tiles away.
+ */
 function findSpots(e, rad, dist){
   var spots = [], x, y, dx, dy, n, o, ok;
   for (y = rad; y < H - rad; y++) for (x = rad; x < W - rad; x++){
@@ -757,6 +927,10 @@ function findSpots(e, rad, dist){
   return spots;
 }
 
+/**
+ * Spawns entity `e` with a 3x3 home territory block and orients its initial
+ * heading inward toward the center of the arena so it doesn't immediately hit a wall.
+ */
 function spawn(e, force){
   var x, y, s, spots = findSpots(e, 4, 24);
   if (!spots.length && e.isPlayer) spots = findSpots(e, 2, 8);
@@ -779,6 +953,11 @@ function spawn(e, force){
   return true;
 }
 
+/**
+ * Eliminates entity `e`, clears its exposed trail, transfers all of its owned
+ * territory to killer `by` (or neutral `0` on tie/0%-land), updates ELO kill
+ * counters, and schedules respawn after 30 ticks (3 seconds).
+ */
 function kill(e, by, cause){
   if (!e.alive) return;
   var tLen = e.trail.length;
@@ -808,10 +987,16 @@ function kill(e, by, cause){
 
 
 // ============================================================================
-// [SECTION 5] GAME RULES, PHYSICS & TERRITORY LOGIC
-// Purpose: Handles grid movement, deferred trail commitment, loop-closing
-// flood fill, head-on collision resolution, and territory percentage counts.
+// [SECTION 5] GAME RULES, PHYSICS & TERRITORY FLOOD-FILL ENGINE
+// Purpose: Executes deterministic grid movement, deferred trail placement,
+// exterior boundary flood-fill for loop enclosures, and head-on collisions.
 // ============================================================================
+
+/**
+ * Flood-fills from all 4 outer arena borders across cells NOT owned by `id`.
+ * Any unvisited cell after the traversal is completely enclosed by `id`'s
+ * border and is converted to `owner[j] = id`. Returns count of newly enclosed cells.
+ */
 function fill(id){
   var seen = new Uint8Array(N), st = [];
   function push(i){ if (!seen[i] && owner[i] !== id){ seen[i] = 1; st.push(i); } }
@@ -828,6 +1013,10 @@ function fill(id){
   return enclosed;
 }
 
+/**
+ * Converts an entity's completed trail into owned territory and invokes `fill()`
+ * to claim any interior area enclosed by the loop.
+ */
 function closeLoop(e){
   var tLen = e.trail.length;
   var prevPct = e.pct;
@@ -842,6 +1031,12 @@ function closeLoop(e){
   // [DEV-LOG END]
 }
 
+/**
+ * Commits the previous tick's pending trail cell (`e.pend`) onto the `trail` grid.
+ * FIX RATIONALE: Deferred by 1 tick so an entity stepping onto an unowned tile
+ * occupies it with its head first; the trail segment behind it only materializes
+ * once the head advances out of that cell (unless blocked by the outer arena wall).
+ */
 function commit(){
   for (var i = 0; i < ents.length; i++){
     var e = ents[i];
@@ -852,6 +1047,12 @@ function commit(){
   }
 }
 
+/**
+ * Advances entity `e` by 1 cell in direction `e.d`.
+ * Clamps at arena walls (surviving without dying, matching Paper.io rules),
+ * cuts any rival trail stepped onto, closes loops upon re-entering home land,
+ * or stages `e.pend` when venturing outside home land.
+ */
 function move(e){
   if (!e.alive) return;
   var ox = e.x, oy = e.y, nx = ox + DX[e.d], ny = oy + DY[e.d];
@@ -875,6 +1076,11 @@ function move(e){
   }
 }
 
+/**
+ * Resolves head-on collisions (two heads entering the same cell OR swapping cells)
+ * BEFORE `commit()` and `move()`. The entity with larger territory % wins;
+ * an exact tie eliminates both entities.
+ */
 function resolveHeadOn(){
   var n = ents.length, nx = [], i, j, a, b, tx, ty;
   for (i = 0; i < n; i++){
@@ -892,6 +1098,10 @@ function resolveHeadOn(){
   }
 }
 
+/**
+ * Recalculates live territory percentages for all entities and eliminates
+ * any living entity whose territory was completely swallowed (`c[e.id] === 0`).
+ */
 function recount(){
   var c = new Array(ents.length + 1), i;
   for (i = 0; i < c.length; i++) c[i] = 0;
@@ -907,17 +1117,28 @@ function recount(){
 
 // ============================================================================
 // [SECTION 6] DEEP PLAYER BEHAVIOR LEARNING (STYLE DNA + CONTEXT CLONING)
-// Purpose: Observes every player tick to extract:
-//   1. 5-level hierarchical context-action probability model (with trail-danger ratio)
-//   2. Efficiency-weighted & context-tagged geometric loop templates (trips)
-//   3. 6 high-level behavioral traits: Aggression, Caution, Wall-Hug Preference,
-//      Land-Stealing Preference, Turn Spin Bias (CW vs CCW), and Home Defense.
+// Purpose: Passively observes every human player tick to extract:
+//   1. A 5-level hierarchical context-action frequency table (`ctxKeys`) using
+//      egocentric relative coordinates so learned habits generalize to any heading.
+//   2. Geometric loop templates (`tripTrack` / `keepTrips`) scored by area gain
+//      and step efficiency.
+//   3. 6 continuous behavioral DNA traits (`aggr`, `caut`, `wallPref`, `stealPref`,
+//      `spinBias`, `defendPref`).
 // ============================================================================
+
+/**
+ * Projects world-space vector `(dx, dy)` into entity `e`'s egocentric frame:
+ * returns `0` (ahead), `1` (right), `2` (behind), or `3` (left).
+ */
 function sector(e, dx, dy){
   var f = dx * DX[e.d] + dy * DY[e.d], r = dx * DX[(e.d + 1) % 4] + dy * DY[(e.d + 1) % 4];
   return Math.abs(f) >= Math.abs(r) ? (f > 0 ? 0 : 2) : (r > 0 ? 1 : 3);
 }
 
+/**
+ * Computes minimum Manhattan distance from any living enemy head to either
+ * entity `e`'s head or any cell of `e`'s exposed trail.
+ */
 function minEnemyDistToTrail(e){
   var bd = 99, n, o, k, d, ti;
   for (n = 0; n < ents.length; n++){
@@ -934,6 +1155,17 @@ function minEnemyDistToTrail(e){
   return bd;
 }
 
+/**
+ * Builds a 5-level hierarchical array of context keys (from ultra-specific level 0
+ * down to coarse level 4) representing the entity's immediate tactical state:
+ *   - `lb`      : trail length bucket (0 = inside home land, 1..6 = trail length tiers)
+ *   - `hs`      : egocentric sector toward home exit cell
+ *   - `wl`      : 1 if outer arena wall is within 2 steps ahead
+ *   - `danger`  : 2 if an enemy can reach `e`'s trail faster than `e` can return home
+ *   - `onEnemy` : 1 if currently carving inside a rival's territory
+ *   - `thr`     : nearest threat type (head vs trail), distance band, and sector
+ *   - `rb`      : run-length bucket of ticks since last turn
+ */
 function ctxKeys(e){
   var cellIdx = e.y * W + e.x;
   var home = owner[cellIdx] === e.id;
@@ -973,6 +1205,10 @@ function ctxKeys(e){
   ];
 }
 
+/**
+ * Increments action counts `[straight, right, uturn, left]` across all 5 context
+ * specificity levels for the player's current decision `act`.
+ */
 function learn(p, act){
   var ks = ctxKeys(p), m = p.model, k, l;
   for (l = 0; l < ks.length; l++){ k = ks[l]; (m[k] || (m[k] = [0, 0, 0, 0]))[act]++; }
@@ -982,6 +1218,11 @@ function learn(p, act){
   else if (act === 2) p.uturns++;
 }
 
+/**
+ * Records complete non-combat expansion excursions outside home territory as
+ * relative `[stepCount, relativeTurn]` sequences so cloned ghosts can replay
+ * the player's signature geometric loop shapes.
+ */
 function tripTrack(p, rel){
   var cellIdx = p.y * W + p.x;
   var out = owner[cellIdx] !== p.id;
@@ -1006,6 +1247,10 @@ function tripTrack(p, rel){
   }
 }
 
+/**
+ * Retains up to 40 best trips: top 28 ranked by composite score `gain + eff * 6`
+ * plus up to 12 most recent trips to preserve late-round style adaptations.
+ */
 function keepTrips(list){
   var a = list.slice().sort(function(x, y){
     var sx = x.g + (x.eff || 0) * 6;
@@ -1017,6 +1262,11 @@ function keepTrips(list){
   return out;
 }
 
+/**
+ * Accumulates continuous behavioral telemetry on every tick to estimate the
+ * player's high-level traits: Aggression (`chT/chA`), Caution (`fT/fA`),
+ * Wall Preference, Steal Preference, and Home Defense (`defT/defA`).
+ */
 function track(p){
   var cellIdx = p.y * W + p.x;
   var out = owner[cellIdx] !== p.id;
@@ -1027,6 +1277,7 @@ function track(p){
     else p.neutralSteps++;
   }
 
+  // Measure Aggression: when within 10 tiles of a rival trail, does player close distance?
   var bd = 11, tx = 0, ty = 0, i, k, o, d;
   for (i = 0; i < ents.length; i++){
     o = ents[i]; if (o === p || !o.alive) continue;
@@ -1040,6 +1291,7 @@ function track(p){
     p.tHunt = true;
   }
 
+  // Measure Caution: when exposed with >= 4 trail segments and an enemy nearby, does player retreat home?
   if (p.trail.length + (p.pend >= 0 ? 1 : 0) >= 4 && headNear(p)){
     var n = nearestOwn(p);
     if (n >= 0){
@@ -1048,6 +1300,7 @@ function track(p){
     }
   }
 
+  // Measure Home Defense: when a rival is actively carving inside player's land, does player intercept?
   for (i = 0; i < ents.length; i++){
     o = ents[i];
     if (o === p || !o.alive || !o.trail.length) continue;
@@ -1071,8 +1324,13 @@ function headNear(e){
 
 // ============================================================================
 // [SECTION 7] TACTICAL GHOST AI & STYLE-MATCHED PATHFINDING
-// Purpose: Combines smart trail interception, home defense, threat-avoiding
-// return routing, context-matched loop replays, and 2-step lookahead move scoring.
+// Purpose: Drives autonomous AI ghosts using a layered decision architecture:
+//   1. Tactical Overrides: Trail interception (`hunt`), threat-aware retreat
+//      (`safestOwn`), and frontier-seeking expansion (`pickGoal`).
+//   2. Style Cloning: Context-matched loop playback (`pickTrip`) and 5-level
+//      hierarchical policy sampling (`policy`).
+//   3. Lookahead Safety Scorer (`scoreMove`): Prevents self-trail collisions,
+//      border stalls, head-on losses, and 2x2 spinning loops.
 // ============================================================================
 function safe(e, c){
   var nx = e.x + DX[c], ny = e.y + DY[c];
@@ -1084,6 +1342,11 @@ function okCell(e, c){
   return nx >= 0 && ny >= 0 && nx < W && ny < H && trail[ny * W + nx] !== e.id;
 }
 
+/**
+ * Greedy Manhattan router toward cell index `t`.
+ * Penalizes stepping onto `e`'s own trail (`+6`) and slightly favors straight
+ * continuation (`+0.5` turn penalty) to avoid unnecessary zig-zagging.
+ */
 function goTo(e, t){
   var tx = t % W, ty = (t / W) | 0, best = -1, bs = 1e9, k, c, nx, ny, sc, d = e.d, ex = tx - e.x, ey = ty - e.y;
   var rem = (d % 2 === 0) ? ex * DX[d] : ey * DY[d];
@@ -1113,6 +1376,11 @@ function nearestOwn(e){
   return best;
 }
 
+/**
+ * Finds the safest home territory cell to retreat to by adding a proximity
+ * penalty (`(5 - ed) * 4`) to any home cell within 4 tiles of a rival head,
+ * preventing retreating ghosts from running straight into an ambush.
+ */
 function safestOwn(e){
   var best = -1, bs = 1e9, i, cx, cy, d, n, o, ed, pen;
   for (i = 0; i < N; i++){
@@ -1131,6 +1399,10 @@ function safestOwn(e){
   return best >= 0 ? best : nearestOwn(e);
 }
 
+/**
+ * Weighted roulette selection of a recorded player loop template (`e.trips`),
+ * boosting trips that match the ghost's current wall-proximity context (`nearWall`).
+ */
 function pickTrip(e){
   var list = e.trips;
   var nearWall = (Math.min(e.x, W - 1 - e.x, e.y, H - 1 - e.y) <= 4) ? 1 : 0;
@@ -1148,6 +1420,12 @@ function pickTrip(e){
   return list[0].s;
 }
 
+/**
+ * Scans for exposed rival trails within `e`'s aggression range.
+ * Only pursues a trail if `e` can reach the target segment (`d <= rivalHomeDist + 2`)
+ * before the rival closes its loop, and expands interception range when the
+ * rival is trespassing inside `e`'s own territory (scaled by `e.defendPref`).
+ */
 function hunt(e){
   if (tick - e.born < 25) return -1;
   var baseRange = 4 + Math.floor(e.aggr * 7);
@@ -1172,7 +1450,14 @@ function hunt(e){
   return best;
 }
 
-// Frontier-aware expansion goal picker: targets unowned cells right along e's border
+/**
+ * Frontier-aware expansion goal selector.
+ * FIX RATIONALE: Previously sampled random unowned cells across the entire map,
+ * causing ghosts that grew to 15-60% territory to spend 25-32 ticks walking inside
+ * their own land toward distant pockets. Awarding `+20` to unowned cells directly
+ * adjacent (`adjOwn`) to `e`'s existing border ensures ghosts step out immediately
+ * along their frontier while still respecting `wallPref` and `stealPref`.
+ */
 function pickGoal(e){
   var best = -1, bestScore = -1e9;
   var wantWall = e.wallPref != null ? e.wallPref : 0.35;
@@ -1200,6 +1485,13 @@ function pickGoal(e){
   return best;
 }
 
+/**
+ * Samples a relative turn action (`0=straight, 1=right, 2=uturn, 3=left`) from the
+ * most specific context bucket in `e.model` that has at least `MINS` (6) samples.
+ * FIX RATIONALE: Inside home territory (`home === true`), blocks repeating the
+ * exact same 90-degree turn (`a === e.lastPolicyAct`) within 2 ticks so stochastic
+ * policy draws cannot trap a ghost in a tight 2x2 circle.
+ */
 function policy(e){
   var ks = ctxKeys(e), c, t, r, a;
   var home = owner[e.y * W + e.x] === e.id;
@@ -1212,7 +1504,6 @@ function policy(e){
       for (a = 0; a < 4; a++){
         r -= c[a];
         if (r < 0){
-          // Prevent consecutive same-way turns inside home territory (eliminates 2x2 loops)
           if (home && e.since <= 2 && (a === 1 || a === 3) && a === e.lastPolicyAct) return 0;
           e.lastPolicyAct = a;
           return a;
@@ -1232,7 +1523,13 @@ function policy(e){
   return 0;
 }
 
-// Evaluates candidate direction c for tactical safety and player-style alignment
+/**
+ * Evaluates candidate direction `c` for tactical safety and Style DNA alignment.
+ * FIX RATIONALE: Awards `+2.0` straight-line momentum (`rel === 0`) so that when
+ * `prefs` is empty (no active turn command), `spinBias` (`+-0.6` max) acts only
+ * as a tie-breaker during turns rather than outscoring straight movement (`0`)
+ * and forcing the ghost to turn 90 degrees every single tick in a 2x2 loop.
+ */
 function scoreMove(e, c, isPreferred){
   var nx = e.x + DX[c], ny = e.y + DY[c];
   if (nx < 0 || ny < 0 || nx >= W || ny >= H) return -1e9;
@@ -1257,7 +1554,6 @@ function scoreMove(e, c, isPreferred){
   if (wd <= 4) sc += ((e.wallPref != null ? e.wallPref : 0.35) - 0.35) * 8;
   if (owner[idx] > 0 && owner[idx] !== e.id) sc += ((e.stealPref != null ? e.stealPref : 0.3) - 0.3) * 8;
 
-  // Natural straight-line momentum prevents aimless 90-degree spinning when prefs is empty
   var rel = (c - e.d + 4) % 4;
   if (rel === 0) sc += 2.0;
   var bias = e.spinBias != null ? e.spinBias : 0;
@@ -1267,6 +1563,14 @@ function scoreMove(e, c, isPreferred){
   return sc;
 }
 
+/**
+ * Master per-tick decision pipeline for every AI ghost:
+ *   1. Evaluates loop safety (`maxTrail`, trail interception danger, nearby heads)
+ *      to decide whether to switch into retreat mode (`e.ret = true`).
+ *   2. Priority hierarchy: `hunt` > `retreat` > `idle > 10` frontier expansion >
+ *      recorded `trip` playback > learned `policy` (or fallback `script`).
+ *   3. Scores all safe candidate directions via `scoreMove` and commits `e.d`.
+ */
 function ghostDecide(e){
   var d = e.d, prefs = [], target = -1, k, c, h, s;
   var out = owner[e.y * W + e.x] !== e.id, len = e.trail.length + (e.pend >= 0 ? 1 : 0);
@@ -1291,6 +1595,8 @@ function ghostDecide(e){
   } else if (e.ret){
     target = safestOwn(e); reason = 'retreat';
   } else if (!out && e.idle > 10){
+    // FIX RATIONALE: Lowered idle threshold from 20 to 10 ticks so ghosts holding
+    // large territories trigger frontier expansion promptly instead of wandering inside.
     if (e.goal < 0 || owner[e.goal] === e.id) e.goal = pickGoal(e);
     target = e.goal; reason = 'goal';
   } else {
@@ -1308,6 +1614,7 @@ function ghostDecide(e){
   }
 
   if (target >= 0){
+    // Instant U-turn shortcut if retreating and home territory is 1 cell directly behind
     var uturnDir = (d + 2) % 4;
     var ux = e.x + DX[uturnDir], uy = e.y + DY[uturnDir];
     if (e.ret && len > 0 && ux >= 0 && uy >= 0 && ux < W && uy < H && owner[uy * W + ux] === e.id){
@@ -1341,7 +1648,7 @@ function ghostDecide(e){
   if (e.d !== d) e.since = 0;
   e.since++;
 
-  // [DEV-LOG START] Log key AI state transitions and anomalies
+  // [DEV-LOG START] Log major AI mode switches and detect anomalous spinning or prolonged idle
   if (reason !== e.prevReason && (reason === 'hunt' || reason === 'retreat' || reason === 'goal' || reason === 'trip')){
     var tInfo = target >= 0 ? ('->(' + (target % W) + ',' + ((target / W) | 0) + ')') : '';
     dlog('[AI-MODE] ' + e.name + ' ' + e.prevReason + '->' + reason + tInfo + ' at (' + e.x + ',' + e.y + ') trail=' + len);
@@ -1366,10 +1673,15 @@ function ghostDecide(e){
 
 
 // ============================================================================
-// [SECTION 8] GRAPHICS & RENDERING ENGINE (CANVAS & MINIMAP)
-// Purpose: Renders the viewport-culled arena, smooth sub-tick interpolated
-// heads, territory/trails, respawn overlays, kill toasts, and the minimap.
+// [SECTION 8] CANVAS RENDERING ENGINE & MINIMAP COMPOSITOR
+// Purpose: Renders smooth 60/120fps sub-tick interpolated movement on top of
+// the 10Hz grid simulation, culls off-screen tiles, draws respawn/kill UI
+// overlays, and composites the top-right radar minimap.
 // ============================================================================
+
+/**
+ * Updates the 80x80 offscreen minimap ImageData pixel-by-pixel from `owner[]`.
+ */
 function updateMini(){
   var d = mimg.data, i, o;
   for (i = 0; i < N; i++){
@@ -1382,6 +1694,10 @@ function updateMini(){
   mctx.putImageData(mimg, 0, 0);
 }
 
+/**
+ * Main render pass. Parameter `a` in `[0, 1]` is the fractional sub-tick
+ * interpolation progress between `(px, py)` and `(x, y)` for silky motion.
+ */
 function draw(a){
   if (!ents.length || !cw) return;
   var p = player, vw = cw / cell, vh = ch / cell;
@@ -1395,9 +1711,11 @@ function draw(a){
   ctx.fillStyle = OUTSIDE; ctx.fillRect(0, 0, cv.width, cv.height);
   ctx.setTransform(dpr, 0, 0, dpr, -Math.round(camX * cell * dpr), -Math.round(camY * cell * dpr));
 
+  // Arena neon border wall & floor
   ctx.fillStyle = WALL; ctx.fillRect(-cell, -cell, (W + 2) * cell, (H + 2) * cell);
   ctx.fillStyle = FLOOR; ctx.fillRect(0, 0, W * cell, H * cell);
 
+  // Viewport culling bounds: only iterate cells currently visible on screen
   var x0 = Math.max(0, Math.floor(camX)), x1 = Math.min(W, Math.ceil(camX + vw));
   var y0 = Math.max(0, Math.floor(camY)), y1 = Math.min(H, Math.ceil(camY + vh));
 
@@ -1406,6 +1724,7 @@ function draw(a){
   for (y = y0; y <= y1; y++){ ctx.moveTo(x0 * cell, y * cell); ctx.lineTo(x1 * cell, y * cell); }
   ctx.stroke();
 
+  // Render owned territory blocks and active trails
   for (y = y0; y < y1; y++) for (x = x0; x < x1; x++){
     i = y * W + x;
     o = owner[i];
@@ -1418,6 +1737,7 @@ function draw(a){
   ctx.strokeStyle = 'rgba(255,43,214,.35)'; ctx.lineWidth = cell * 0.5;
   ctx.strokeRect(cell * 0.25, cell * 0.25, W * cell - cell * 0.5, H * cell - cell * 0.5);
 
+  // Render living entity heads (with eyes on AI ghosts to distinguish them from the human player)
   for (i = 0; i < ents.length; i++){
     e = ents[i];
     if (!e.alive) continue;
@@ -1434,6 +1754,7 @@ function draw(a){
 
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
 
+  // Player respawn countdown overlay
   if (!p.alive && p.deaths < LIVES){
     var rem = p.respawn - tick, fs = Math.round(Math.min(cw, ch) * 0.3);
     ctx.globalAlpha = 1;
@@ -1445,6 +1766,7 @@ function draw(a){
     ctx.fillText('You died - ' + (LIVES - p.deaths) + (LIVES - p.deaths === 1 ? ' life' : ' lives') + ' left', cw / 2, ch / 2 - fs * 0.75);
   }
 
+  // Elimination territory-capture toast notification
   if (tick < toast.until){
     ctx.globalAlpha = Math.min(1, (toast.until - tick) / 8);
     ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.fillStyle = '#fff';
@@ -1453,6 +1775,7 @@ function draw(a){
     ctx.globalAlpha = 1;
   }
 
+  // Top-right radar minimap with camera viewport box and live head blips
   var ms = Math.round(Math.min(92, cw * 0.26)), mx = cw - ms - 6, my = 6;
   ctx.imageSmoothingEnabled = false;
   ctx.globalAlpha = 0.9; ctx.drawImage(mini, mx, my, ms, ms);
@@ -1481,10 +1804,17 @@ function resize(){
 
 
 // ============================================================================
-// [SECTION 9] UI SCREENS, LEADERBOARDS, INPUTS & ROUND LIFECYCLE
-// Purpose: Renders Start Lobby, Login/Register, Leaderboards, Ghost Roster,
-// End-of-Round DNA & ELO Summary, touch controls, and the main animation loop.
+// [SECTION 9] UI SCREENS, TOUCH INPUTS & FIXED-TIMESTEP SIMULATION LOOP
+// Purpose: Manages player turn buffering, the 10Hz `step()` orchestrator,
+// matchmaking launch (`launchMatch` / `initArenaWithGhosts`), and all 5 modal
+// screens (Lobby, Auth, Leaderboards, Ghost Roster, and End-of-Round Summary).
 // ============================================================================
+
+/**
+ * Enqueues a cardinal turn direction `nd` into the 2-slot input buffer `q`.
+ * Deduplicates consecutive identical directions so a single swipe never wastes
+ * both buffer slots.
+ */
 function turn(nd){
   var lastD = q.length ? q[q.length - 1] : (player ? player.d : 0);
   if (nd === lastD) return;
@@ -1498,6 +1828,11 @@ function turn(nd){
   }
 }
 
+/**
+ * Pops the next buffered player turn, records the action in the behavioral
+ * cloning model (`learn` + `tripTrack` + `track`) BEFORE updating `p.d` so the
+ * context keys reflect the exact state in which the player made the decision.
+ */
 function playerDecide(p){
   var nd = q.length ? q.shift() : -1, turned = nd >= 0 && nd !== p.d, rel = turned ? (nd - p.d + 4) % 4 : 0;
   learn(p, rel);
@@ -1529,6 +1864,13 @@ function roomLeft(){
   return findSpots(player, 4, 0).length > 0;
 }
 
+/**
+ * Advances the simulation by 1 deterministic logic tick (100ms):
+ *   1. Handles respawns for dead entities whose 30-tick timer expired.
+ *   2. Collects movement decisions (`playerDecide` / `ghostDecide`) for all living entities.
+ *   3. Resolves head-on collisions, commits pending trails, moves heads, and updates territory %.
+ *   4. Checks round termination conditions (`lives`, `noroom`, or `won`).
+ */
 function step(){
   tick++;
   var i, e;
@@ -1559,7 +1901,7 @@ function step(){
   updateMini();
   if (tick % 3 === 0) updateHud();
 
-  // [DEV-LOG START] Periodic 5-second snapshot
+  // [DEV-LOG START] Periodic 5-second full-arena state snapshot
   if (tick % 50 === 0){
     var snap = ents.map(function(en){
       var isOut = en.alive && owner[en.y * W + en.x] !== en.id ? 1 : 0;
@@ -1573,6 +1915,10 @@ function step(){
   else if (player.alive && tick % 5 === 0 && rivalsOut() && !roomLeft()) endRound('won');
 }
 
+/**
+ * `requestAnimationFrame` driver with fixed-timestep accumulator (`acc >= TICK_MS`)
+ * and a 500ms frame-delta clamp to prevent spiral-of-death catchup after tab switches.
+ */
 function frame(t){
   if (!running) return;
   if (!last) last = t;
@@ -1585,6 +1931,10 @@ function frame(t){
 
 function showCard(html){ card.innerHTML = html; ov.style.display = 'flex'; }
 
+/**
+ * Fetches hydrated opponent ghosts from `/api/match` (or local storage if guest
+ * in `mine` mode) and transitions into `initArenaWithGhosts`.
+ */
 function launchMatch(opts){
   opts = opts || {};
   var mode = opts.mode || gameMode;
@@ -1631,11 +1981,17 @@ function launchMatch(opts){
   });
 }
 
+/**
+ * Resets grid buffers and populates the arena with the human player (`ents[0]`)
+ * plus up to 4 hydrated cloud ghosts.
+ * FIX RATIONALE [RULE-04]: `Local#` localStorage backfill is strictly gated behind
+ * `if (!currentUser)` so authenticated accounts never face stale local browser ghosts.
+ */
 function initArenaWithGhosts(cloudGhosts){
   owner = new Uint8Array(N); trail = new Uint8Array(N);
   ents = []; tick = 0; q = []; tripSum = 0; tripN = 0; trips = []; toast.until = 0;
 
-  // [DEV-LOG START] Reset match log
+  // [DEV-LOG START] Reset match log at round start
   devLogs = [];
   // [DEV-LOG END]
 
@@ -1667,7 +2023,6 @@ function initArenaWithGhosts(cloudGhosts){
     id++;
   });
 
-  // Only backfill with Local# ghosts when playing as a Guest (not logged in)
   if (!currentUser && ents.length < 5){
     var localFallbacks = pickLocalGhosts(loadLocalRuns());
     for (var lf = 0; lf < localFallbacks.length && ents.length < 5; lf++){
@@ -1685,7 +2040,6 @@ function initArenaWithGhosts(cloudGhosts){
     }
   }
 
-  // Fill remaining slots up to 5 total entities with standard BOTs
   while (ents.length < 5){
     g = mk(id, 'BOT-' + (id - 1), false);
     g.script = genDefault(); g.maxTrail = 16 + rnd(12); g.aggr = 0.3 + Math.random() * 0.4;
@@ -1714,6 +2068,7 @@ function initArenaWithGhosts(cloudGhosts){
 
 // --- Screen 1: Main Start Lobby ---
 function showStart(){
+  // Reset temporary leaderboard revenge mode back to standard ranked mode on lobby return
   if (gameMode === 'ghost') gameMode = 'others';
   var accountBar = '';
   if (currentUser){
@@ -1842,7 +2197,7 @@ function showAuth(tab){
   };
 }
 
-// --- Screen 3: Global Leaderboards (Top Players & Top Ghosts + Challenge Button) ---
+// --- Screen 3: Global Leaderboards (Top Players & Top Ghosts + Direct Challenge Button) ---
 function showLeaderboards(){
   showCard('<h2>🏆 Leaderboards</h2><div class="muted">Loading rankings...</div>');
   apiFetch('/api/leaderboards').then(function(res){
@@ -1957,12 +2312,13 @@ function showRoster(){
   }
 }
 
-// --- Screen 5: End of Round & Deep Style DNA Summary ---
+// --- Screen 5: End of Round, Style DNA Summary & Cloud Sync ---
 function endRound(reason){
   if (!running) return;
   running = false;
   draw(1); updateHud();
 
+  // Compute 6-axis Style DNA ratios from accumulated player telemetry
   var tl = trips.slice().sort(function(a, b){ return a - b; });
   var cs = player.chT + player.chA;
   var aggr = cs >= 20 ? Math.max(0.15, Math.min(0.92, (player.chT / cs - 0.38) / 0.42)) : Math.min(0.9, 0.3 + player.kills * 0.12);
@@ -1989,7 +2345,7 @@ function endRound(reason){
   var bestTrips = keepTrips(player.tlist);
   var won = reason === 'won';
 
-  // Save locally only when playing as Guest
+  // [RULE-04] Persist locally in localStorage ONLY when playing as an unauthenticated Guest
   if (!currentUser && player.ns >= 40){
     var store = loadLocalRuns();
     store.n++;
@@ -2063,6 +2419,7 @@ function endRound(reason){
     }
   }
 
+  // Practice matches against one's own ghosts (`mode === 'mine'`) do not affect ELO
   var isRanked = !lastMatchConfig || lastMatchConfig.mode !== 'mine';
 
   apiFetch('/api/report', {
@@ -2119,7 +2476,7 @@ function endRound(reason){
   });
 }
 
-// Touch swipe controls, resize, and auto-pause
+// Mobile touch swipe gesture recognizer (16px deadzone prevents accidental micro-turns)
 var tsx = 0, tsy = 0;
 window.addEventListener('touchstart', function(ev){
   var t = ev.touches[0]; tsx = t.clientX; tsy = t.clientY;
@@ -2136,6 +2493,7 @@ window.addEventListener('touchmove', function(ev){
 
 window.addEventListener('resize', resize);
 
+// Automatically pauses the game if the mobile browser is backgrounded/minimized
 document.addEventListener('visibilitychange', function(){
   if (!document.hidden || !running) return;
   running = false;
@@ -2155,16 +2513,18 @@ document.addEventListener('visibilitychange', function(){
   // [DEV-LOG END]
 });
 
-// Boot sequence: restore session if token exists, then show lobby
+// Boot sequence: restore persisted user session if token exists, then open Start Lobby
 refreshSession().then(showStart);
 })();
 </script>
 </body>
 </html>`;
 
+
 // ============================================================================
-// [WORKER SECTION 3] HTTP ROUTER
-// Purpose: Dispatches API requests to D1/KV handlers and serves the HTML game.
+// [WORKER SECTION 3] CLOUDFLARE WORKER HTTP FETCH ROUTER
+// Purpose: Entrypoint for all incoming HTTP requests; routes `/api/*` paths to
+// their respective D1/KV handlers and serves the HTML5 game client for `/`.
 // ============================================================================
 export default {
   async fetch(request, env) {
