@@ -1,5 +1,18 @@
 {
   "name": "ghost-io",
   "main": "ghost-io.js",
-  "compatibility_date": "2026-01-01"
+  "compatibility_date": "2026-01-01",
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "ghost-io-db",
+      "database_id": "c2c892a9-d5c4-4f34-abc3-6cbd80bf5f40"
+    }
+  ],
+  "kv_namespaces": [
+    {
+      "binding": "KV",
+      "id": "bd1635feeff24e29a989e23fe9c2a87d"
+    }
+  ]
 }
