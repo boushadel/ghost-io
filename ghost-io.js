@@ -55,6 +55,12 @@
 //               human cutback maneuver). Track and replay early-game vs late-game
 //               loop sizing (`earlyMaxTrail` vs `lateMaxTrail`) so ghosts scale
 //               their loop ambition dynamically with territory percentage.
+//   - [RULE-10] Zero Hardcoded "Smartness" Overrides: NEVER inject hardcoded
+//               tactical safety/evasion/retreat intelligence that makes a ghost
+//               smarter or more cautious than its human owner. Every tactical
+//               reaction (head-on avoidance, trail-threat retreat, hunt range,
+//               and loop selection) MUST scale proportionally from traits
+//               observed in that player's single round (`caut`, `aggr`, `awareness`).
 //
 // [C] SYSTEM ARCHITECTURE & DATABASE SCHEMA REFERENCE
 // ----------------------------------------------------------------------------
@@ -67,7 +73,7 @@
 //      - Real-time 80x80 grid territory-capture game (Paper.io mechanics).
 //      - Observes human player decisions every tick to extract a 5-level
 //        hierarchical context-action probability model, geometric loop shapes
-//        ("trips"), and 6 high-level behavioral DNA traits.
+//        ("trips"), and continuous behavioral DNA traits.
 //      - Clones player behavior into autonomous AI ghosts that fight other
 //        players asynchronously while the owner is offline.
 //   3. Cloudflare D1 Tables:
@@ -86,7 +92,7 @@
 // [WORKER SECTION 1] CRYPTOGRAPHY, AUTHENTICATION & DNA CLASSIFICATION HELPERS
 // Purpose: Provides stateless JSON response builders, Web Crypto token/password
 // hashing, Bearer token session resolution, input sanitization, and automatic
-// archetype badge assignment based on a player's extracted 6-axis Style DNA.
+// archetype badge assignment based on a player's extracted Style DNA.
 // ============================================================================
 
 /**
@@ -393,6 +399,7 @@ async function handleMatch(request, env) {
         spinBias: brain?.spinBias ?? 0,
         defendPref: brain?.defendPref ?? 0.5,
         uturnRate: brain?.uturnRate ?? 0.03,
+        awareness: brain?.awareness ?? Math.min(0.95, (r.aggr + r.caut) * 0.6),
         model: brain?.model || null,
         trips: brain?.trips || null,
       };
@@ -425,8 +432,8 @@ async function handleReport(request, env) {
   const kills = Math.round(clampNum(round.kills, 0, 50, 0));
   const ns = Math.round(clampNum(round.ns, 0, 100000, 0));
   const won = Boolean(round.won);
-  const aggr = Math.round(clampNum(round.aggr, 0.1, 0.95, 0.4) * 100) / 100;
-  const caut = Math.round(clampNum(round.caut, 0.1, 0.95, 0.4) * 100) / 100;
+  const aggr = Math.round(clampNum(round.aggr, 0.05, 0.95, 0.4) * 100) / 100;
+  const caut = Math.round(clampNum(round.caut, 0.05, 0.95, 0.4) * 100) / 100;
   const maxTrail = Math.round(clampNum(round.maxTrail, 10, 80, 20));
   const earlyMaxTrail = Math.round(clampNum(round.earlyMaxTrail, 10, 72, Math.min(maxTrail, 24)));
   const lateMaxTrail = Math.round(clampNum(round.lateMaxTrail, 10, 80, maxTrail));
@@ -435,6 +442,7 @@ async function handleReport(request, env) {
   const spinBias = Math.round(clampNum(round.spinBias, -1, 1, 0) * 100) / 100;
   const defendPref = Math.round(clampNum(round.defendPref, 0, 1, 0.5) * 100) / 100;
   const uturnRate = Math.round(clampNum(round.uturnRate, 0, 0.5, 0.03) * 1000) / 1000;
+  const awareness = Math.round(clampNum(round.awareness, 0.05, 0.98, 0.5) * 100) / 100;
 
   const challengerName = user ? user.username : "Guest";
   const challengerElo = user ? user.elo : 1000;
@@ -557,6 +565,7 @@ async function handleReport(request, env) {
         spinBias,
         defendPref,
         uturnRate,
+        awareness,
       });
 
       await env.KV.put(kvKey, brainPayload);
@@ -620,8 +629,6 @@ async function handleManageGhost(request, env) {
 // CLIENT GAME HTML & ENGINE (MOBILE-FIRST PAPER.IO + DEEP BEHAVIORAL CLONING)
 // [RULE-06] CRITICAL INVARIANT: Do NOT place any backtick character (`)
 // anywhere inside this String.raw template literal.
-// FIX RATIONALE [RULE-06]: Stripped all backticks from inline JSDoc comments
-// inside HTML so Wrangler esbuild never terminates String.raw early.
 // ============================================================================
 const HTML = String.raw`<!doctype html>
 <html lang="en">
@@ -911,9 +918,9 @@ function mk(id, name, isPlayer){
     trail: [], exit: -1, respawn: 0, kills: 0, pct: 0, peak: 0, deaths: 0, wait: 0,
     // Cloud metadata & combat telemetry for ELO calculation:
     dbId: 0, badge: '', elo: 1000, killsOnPlayer: 0, killedByPlayer: 0,
-    // 6-axis Behavioral Cloning DNA traits (loaded from KV for ghosts, or default for bots):
+    // Behavioral Cloning DNA traits (loaded from KV for ghosts, or default for bots):
     script: null, si: 0, sc: 0, maxTrail: 20, earlyMaxTrail: 20, lateMaxTrail: 20, aggr: 0.4, caut: 0.3,
-    wallPref: 0.35, stealPref: 0.3, spinBias: 0, defendPref: 0.5, uturnRate: 0.03,
+    wallPref: 0.35, stealPref: 0.3, spinBias: 0, defendPref: 0.5, uturnRate: 0.03, awareness: 0.5,
     // Real-time single-round player telemetry accumulators (recorded only when isPlayer === true):
     idle: 0, goal: -1, since: 0, pend: -1, model: null, ns: 0,
     chT: 0, chA: 0, fT: 0, fA: 0,
@@ -1149,10 +1156,10 @@ function recount(){
 // ([RULE-07]) to extract:
 //   1. A 5-level hierarchical context-action frequency table (ctxKeys) using
 //      egocentric relative coordinates so learned habits generalize to any heading.
-//   2. Geometric loop templates (tripTrack / keepTrips) scored by area gain
-//      and step efficiency.
-//   3. 6 continuous behavioral DNA traits (aggr, caut, wallPref, stealPref,
-//      spinBias, defendPref) plus phase-scaled loop limits ([RULE-08]/[RULE-09]).
+//   2. Geometric loop templates (tripTrack / keepTrips) mirroring the player's
+//      actual loop distribution (not artificially filtered to "best only").
+//   3. Continuous behavioral DNA traits (aggr, caut, wallPref, stealPref,
+//      spinBias, defendPref, uturnRate, awareness) plus phase-scaled loop limits.
 // ============================================================================
 
 /**
@@ -1276,17 +1283,19 @@ function tripTrack(p, rel){
 }
 
 /**
- * Retains up to 40 best trips: top 28 ranked by composite score (gain + eff * 6)
- * plus up to 12 most recent trips to preserve late-round style adaptations.
+ * Retains a faithful representative sample (up to 40 trips) across the entire
+ * single round without cherry-picking only high-gain loops.
+ * FIX RATIONALE [RULE-10]: Previously sorted trips by highest (gain + eff * 6),
+ * which discarded a cautious or beginner player's small/modest loops and made
+ * their ghost play more ambitiously than the player actually did. Now uniformly
+ * samples across the player's chronological trip list so loop sizes match reality.
  */
 function keepTrips(list){
-  var a = list.slice().sort(function(x, y){
-    var sx = x.g + (x.eff || 0) * 6;
-    var sy = y.g + (y.eff || 0) * 6;
-    return sy - sx;
-  });
-  var out = a.slice(0, 28), rest = list.slice(-12), i;
-  for (i = 0; i < rest.length; i++) if (out.indexOf(rest[i]) < 0) out.push(rest[i]);
+  if (list.length <= 40) return list.slice();
+  var out = [], step = list.length / 40;
+  for (var i = 0; i < 40; i++){
+    out.push(list[Math.floor(i * step)]);
+  }
   return out;
 }
 
@@ -1361,13 +1370,9 @@ function headNear(e){
 
 // ============================================================================
 // [SECTION 7] TACTICAL GHOST AI & STYLE-MATCHED PATHFINDING
-// Purpose: Drives autonomous AI ghosts using a layered decision architecture:
-//   1. Tactical Overrides: Trail interception (hunt), threat-aware retreat
-//      (safestOwn), and frontier-seeking expansion (pickGoal).
-//   2. Style Cloning: Context-matched loop playback (pickTrip) and 5-level
-//      hierarchical policy sampling (policy).
-//   3. Lookahead Safety Scorer (scoreMove): Supports 180-degree U-turns,
-//      prevents border stalls, head-on losses, and 2x2 spinning loops.
+// Purpose: Drives autonomous AI ghosts strictly through the human player's
+// learned behavioral parameters ([RULE-08], [RULE-10]) — without hardcoded
+// "smartness" overrides that would make a reckless player's ghost play safely.
 // ============================================================================
 function safe(e, c){
   var nx = e.x + DX[c], ny = e.y + DY[c];
@@ -1427,12 +1432,13 @@ function nearestOwn(e){
 }
 
 /**
- * Finds the safest home territory cell to retreat to by penalizing both:
- *   1. Home cells within 4 tiles of a rival head ((5 - ed) * 4), AND
- *   2. Retreat paths whose midpoint passes within 3 tiles of a rival head (+14),
- *      preventing retreating ghosts from running across an enemy's strike path.
+ * Selects a home territory cell to retreat to, scaling enemy-avoidance
+ * awareness by e.awareness (so attentive players pick unguarded return borders
+ * while oblivious players simply head to the nearest home tile).
  */
 function safestOwn(e){
+  var aw = e.awareness != null ? e.awareness : 0.5;
+  if (aw < 0.25) return nearestOwn(e);
   var best = -1, bs = 1e9, i, cx, cy, mx, my, d, n, o, ed, md, pen;
   for (i = 0; i < N; i++){
     if (owner[i] !== e.id) continue;
@@ -1444,9 +1450,9 @@ function safestOwn(e){
       o = ents[n];
       if (o === e || !o.alive) continue;
       ed = Math.abs(o.x - cx) + Math.abs(o.y - cy);
-      if (ed <= 4) pen += (5 - ed) * 4;
+      if (ed <= 4) pen += (5 - ed) * 4 * aw;
       md = Math.abs(o.x - mx) + Math.abs(o.y - my);
-      if (md <= 3) pen += (4 - md) * 5;
+      if (md <= 3) pen += (4 - md) * 5 * aw;
     }
     if (d + pen < bs){ bs = d + pen; best = i; }
   }
@@ -1454,20 +1460,23 @@ function safestOwn(e){
 }
 
 /**
- * Weighted roulette selection of a recorded player loop template (e.trips),
- * boosting trips that match the ghost's current wall-proximity context (nearWall).
+ * Uniformly samples a recorded player loop template (e.trips) with gentle
+ * preference for matching wall-proximity context (nearWall), preserving the
+ * player's natural distribution of small, medium, and large loops.
+ * FIX RATIONALE [RULE-10]: Removed artificial weighting toward high-gain loops
+ * so ghosts replay the player's actual loop sizes rather than only their luckiest ones.
  */
 function pickTrip(e){
   var list = e.trips;
   var nearWall = (Math.min(e.x, W - 1 - e.x, e.y, H - 1 - e.y) <= 4) ? 1 : 0;
   var tot = 0, i, r, w;
   for (i = 0; i < list.length; i++){
-    w = (1 + Math.min(list[i].g, 120) + (list[i].eff || 0) * 6) * (list[i].w === nearWall ? 2.2 : 0.75);
+    w = (list[i].w === nearWall) ? 1.8 : 0.8;
     tot += w;
   }
   r = Math.random() * tot;
   for (i = 0; i < list.length; i++){
-    w = (1 + Math.min(list[i].g, 120) + (list[i].eff || 0) * 6) * (list[i].w === nearWall ? 2.2 : 0.75);
+    w = (list[i].w === nearWall) ? 1.8 : 0.8;
     r -= w;
     if (r < 0) return list[i].s;
   }
@@ -1475,14 +1484,13 @@ function pickTrip(e){
 }
 
 /**
- * Scans for exposed rival trails within 'e's aggression range.
- * Only pursues a trail if 'e' can reach the target segment (d <= rivalHomeDist + 2)
- * before the rival closes its loop, and expands interception range when the
- * rival is trespassing inside 'e's own territory (scaled by e.defendPref).
+ * Scans for exposed rival trails within 'e's learned aggression range.
+ * Passive/non-aggressive players (e.aggr < 0.2) rarely hunt unless a rival
+ * is literally 1-2 tiles in front of them; hunters pursue up to 11 tiles.
  */
 function hunt(e){
   if (tick - e.born < 25) return -1;
-  var baseRange = 4 + Math.floor(e.aggr * 7);
+  var baseRange = Math.max(2, Math.floor(e.aggr * 11));
   var best = -1, bestScore = 1e9;
   for (var n = 0; n < ents.length; n++){
     var o = ents[n];
@@ -1495,7 +1503,7 @@ function hunt(e){
     for (var k = 0; k < o.trail.length; k++){
       var idx = o.trail[k];
       var d = Math.abs((idx % W) - e.x) + Math.abs(((idx / W) | 0) - e.y);
-      if (d <= range && d <= rivalHomeDist + 2){
+      if (d <= range && (e.aggr < 0.45 || d <= rivalHomeDist + 3)){
         var score = d - (trespassing ? 3.5 : 0);
         if (score < bestScore){ bestScore = score; best = idx; }
       }
@@ -1582,11 +1590,13 @@ function policy(e){
 }
 
 /**
- * Evaluates candidate direction 'c' for tactical safety and Style DNA alignment.
- * FIX RATIONALE [RULE-09]: Removed the -32 own-trail penalty that previously blocked
- * 180-degree U-turns onto an entity's own trail (stepping on own trail is completely
- * safe in Ghost.io physics). Applies only a tiny -1.5 spread bias when expanding
- * (!e.ret), and 0 penalty when retreating (e.ret) or following a preferred U-turn.
+ * Evaluates candidate direction 'c' for Style DNA alignment and player-scaled
+ * hazard awareness.
+ * FIX RATIONALE [RULE-10]: Previously applied hardcoded -80 / -28 collision
+ * penalties to ALL ghosts regardless of player skill. Now scales head-on and
+ * exposed-trail danger penalties by e.awareness (0.05..0.98) so oblivious or
+ * reckless players produce ghosts that genuinely walk into danger just like
+ * their owners, while attentive players produce sharp evasive ghosts.
  */
 function scoreMove(e, c, isPreferred){
   var nx = e.x + DX[c], ny = e.y + DY[c];
@@ -1595,6 +1605,7 @@ function scoreMove(e, c, isPreferred){
   var idx = ny * W + nx;
   var len = e.trail.length + (e.pend >= 0 ? 1 : 0);
   var sc = isPreferred ? 50 : 0;
+  var aw = e.awareness != null ? e.awareness : 0.5;
 
   if (e.ret && len > 0 && owner[idx] === e.id) sc += 35;
   if (!e.ret && trail[idx] === e.id) sc -= 1.5;
@@ -1603,9 +1614,9 @@ function scoreMove(e, c, isPreferred){
     var o = ents[n];
     if (o === e || !o.alive) continue;
     var d = Math.abs(o.x - nx) + Math.abs(o.y - ny);
-    if (d === 0 && o.pct >= e.pct) sc -= 80;
-    else if (d === 1 && len > 0) sc -= 28;
-    else if (d === 1 && o.pct >= e.pct) sc -= 18;
+    if (d === 0 && o.pct >= e.pct) sc -= 80 * aw;
+    else if (d === 1 && len > 0) sc -= 28 * aw;
+    else if (d === 1 && o.pct >= e.pct) sc -= 18 * aw;
   }
 
   var wd = Math.min(nx, W - 1 - nx, ny, H - 1 - ny);
@@ -1624,7 +1635,7 @@ function scoreMove(e, c, isPreferred){
 /**
  * Computes the ghost's current effective trail limit by interpolating between
  * earlyMaxTrail (when pct < 15%) and lateMaxTrail (when pct >= 35%),
- * mirroring how human players play tightly early on and take huge sweeps when dominant.
+ * mirroring how human players scale loop size across early vs late game.
  */
 function effectiveMaxTrail(e){
   var early = e.earlyMaxTrail != null ? e.earlyMaxTrail : Math.min(e.maxTrail, 26);
@@ -1637,10 +1648,11 @@ function effectiveMaxTrail(e){
 
 /**
  * Master per-tick decision pipeline for every AI ghost:
- *   1. Evaluates dynamic loop safety (effectiveMaxTrail, trail interception danger,
- *      nearby heads) to decide whether to switch into retreat mode (e.ret = true).
+ *   1. Evaluates loop return purely from player-observed traits (effectiveMaxTrail
+ *      and caution-gated threat checks — reckless players with low e.caut will
+ *      overextend and get their trails cut just like they did in their round).
  *   2. Priority hierarchy: hunt > retreat > idle > 10 frontier expansion >
- *      danger-checked trip playback > learned policy (or fallback script).
+ *      caution-checked trip playback > learned policy (or fallback script).
  *   3. Scores all 4 candidate directions (including 180° U-turns) via scoreMove()
  *      and commits e.d.
  */
@@ -1658,8 +1670,11 @@ function ghostDecide(e){
     var td = minEnemyDistToTrail(e);
     var safeHome = safestOwn(e);
     var hd = safeHome >= 0 ? (Math.abs((safeHome % W) - e.x) + Math.abs(((safeHome / W) | 0) - e.y)) : 0;
+    // FIX RATIONALE [RULE-10]: Gate trail-threat retreat behind player-observed e.caut
+    // so reckless/overextending players produce ghosts that finish greedy loops instead
+    // of magically fleeing every threat.
     if (len > curMaxTrail) e.ret = true;
-    else if (len >= 2 && td <= hd + 1 && td <= 6) e.ret = true;
+    else if (len >= 2 && !e.ret && td <= hd + 1 && td <= 6 && Math.random() < (e.caut * 1.15)) e.ret = true;
     else if (len >= 4 && !e.ret && headNear(e) && Math.random() < e.caut) e.ret = true;
   }
 
@@ -1673,11 +1688,11 @@ function ghostDecide(e){
     target = e.goal; reason = 'goal';
   } else {
     e.goal = -1;
-    // FIX RATIONALE [RULE-08]: Before launching a new recorded trip (!e.tpl), check if
-    // an enemy head is already lurking within 5 tiles — smart players abort/retreat or
-    // turn back instead of blindly launching a long trip right into an ambush.
+    // FIX RATIONALE [RULE-10]: Abort trip launch near an enemy ONLY proportionally to
+    // the human player's observed caution (e.caut), allowing fearless/reckless ghosts
+    // to step right out in front of rivals just like their human owner did.
     if (e.model && out && e.trips && e.trips.length){
-      var enemyNearStart = !e.tpl && minEnemyDistToTrail(e) <= 5 && e.caut > 0.35;
+      var enemyNearStart = !e.tpl && minEnemyDistToTrail(e) <= 5 && Math.random() < e.caut;
       if (enemyNearStart){
         e.ret = true;
         target = safestOwn(e);
@@ -2042,7 +2057,8 @@ function launchMatch(opts){
         stealPref: r.stealPref != null ? r.stealPref : 0.3,
         spinBias: r.spinBias != null ? r.spinBias : 0,
         defendPref: r.defendPref != null ? r.defendPref : 0.5,
-        uturnRate: r.uturnRate != null ? r.uturnRate : 0.03
+        uturnRate: r.uturnRate != null ? r.uturnRate : 0.03,
+        awareness: r.awareness != null ? r.awareness : 0.5
       };
     });
     fetchPromise = Promise.resolve({ ok: true, ghosts: localPicks });
@@ -2105,6 +2121,7 @@ function initArenaWithGhosts(cloudGhosts){
     g.spinBias = r.spinBias != null ? r.spinBias : 0;
     g.defendPref = r.defendPref != null ? r.defendPref : 0.5;
     g.uturnRate = r.uturnRate != null ? r.uturnRate : 0.03;
+    g.awareness = r.awareness != null ? r.awareness : Math.min(0.95, (g.aggr + g.caut) * 0.6);
     ents.push(g);
     id++;
   });
@@ -2124,6 +2141,7 @@ function initArenaWithGhosts(cloudGhosts){
       g.spinBias = lr.spinBias != null ? lr.spinBias : 0;
       g.defendPref = lr.defendPref != null ? lr.defendPref : 0.5;
       g.uturnRate = lr.uturnRate != null ? lr.uturnRate : 0.03;
+      g.awareness = lr.awareness != null ? lr.awareness : 0.5;
       ents.push(g); id++;
     }
   }
@@ -2131,7 +2149,7 @@ function initArenaWithGhosts(cloudGhosts){
   while (ents.length < 5){
     g = mk(id, 'BOT-' + (id - 1), false);
     g.script = genDefault(); g.maxTrail = 16 + rnd(12); g.earlyMaxTrail = g.maxTrail; g.lateMaxTrail = g.maxTrail + 6;
-    g.aggr = 0.3 + Math.random() * 0.4;
+    g.aggr = 0.3 + Math.random() * 0.4; g.awareness = 0.4;
     ents.push(g); id++;
   }
 
@@ -2143,8 +2161,9 @@ function initArenaWithGhosts(cloudGhosts){
     var de = ents[di];
     dlog('[ENT] ' + de.name + ' pos=(' + de.x + ',' + de.y + ') d=' + de.d + ' badge=' + de.badge +
          ' model=' + (de.model ? Object.keys(de.model).length : 0) + ' trips=' + (de.trips ? de.trips.length : 0) +
-         ' aggr=' + de.aggr + ' caut=' + de.caut + ' wall=' + de.wallPref + ' steal=' + de.stealPref +
-         ' spin=' + de.spinBias + ' def=' + de.defendPref + ' maxTrail=' + de.earlyMaxTrail + '/' + de.lateMaxTrail);
+         ' aggr=' + de.aggr + ' caut=' + de.caut + ' aw=' + de.awareness + ' wall=' + de.wallPref +
+         ' steal=' + de.stealPref + ' spin=' + de.spinBias + ' def=' + de.defendPref +
+         ' maxTrail=' + de.earlyMaxTrail + '/' + de.lateMaxTrail);
   }
   // [DEV-LOG END]
 
@@ -2402,30 +2421,33 @@ function showRoster(){
 }
 
 // --- Screen 5: End of Round, Style DNA Summary & Cloud Sync ---
-// [RULE-07] & [RULE-08]: Extracts Style DNA strictly from this single round's
-// telemetry so smart/cautious/reckless players produce matching single-round ghosts.
+// [RULE-07] & [RULE-08] & [RULE-10]: Extracts Style DNA strictly from this single
+// round's telemetry with zero upward bias so every player type produces an authentic mirror.
 function endRound(reason){
   if (!running) return;
   running = false;
   draw(1); updateHud();
 
-  // Compute 6-axis Style DNA ratios + early/late trail limits from this single round
-  // FIX RATIONALE [RULE-09]: Computes earlyMaxTrail (<20% land) and lateMaxTrail
-  // (>=20% land) separately so ghosts match how the human player scales loop size
-  // across early-game buildup vs late-game map domination.
+  // Compute Style DNA ratios + early/late trail limits + tactical awareness from this single round
+  // FIX RATIONALE [RULE-10]: Allows aggr and caut to drop down to 0.05 for genuinely
+  // passive or reckless players, and computes 'awareness' directly from observed threat
+  // reactions (fT/fA and chT/chA) rather than assuming every player is alert.
   var tl = trips.slice().sort(function(a, b){ return a - b; });
   var cs = player.chT + player.chA;
-  var aggr = cs >= 8 ? Math.max(0.15, Math.min(0.92, (player.chT / cs - 0.35) / 0.45)) : Math.min(0.9, 0.25 + player.kills * 0.14);
+  var aggr = cs >= 6 ? Math.max(0.05, Math.min(0.92, (player.chT / cs - 0.30) / 0.50)) : Math.min(0.85, 0.15 + player.kills * 0.15);
   var fs = player.fT + player.fA;
-  var caut = fs >= 5 ? Math.max(0.15, Math.min(0.95, (player.fT / fs - 0.40) / 0.45)) : (player.maxObservedTrail > 36 ? 0.25 : 0.45);
+  var caut = fs >= 4 ? Math.max(0.05, Math.min(0.95, (player.fT / fs - 0.35) / 0.50)) : (player.maxObservedTrail > 36 ? 0.15 : 0.35);
+  var awareness = (fs + cs >= 6)
+    ? Math.max(0.10, Math.min(0.96, ((player.fT + player.chT) / (fs + cs) - 0.25) / 0.55))
+    : Math.max(0.15, Math.min(0.85, 0.25 + player.kills * 0.10 - player.deaths * 0.06));
   var closedP90 = tl.length ? tl[Math.floor((tl.length - 1) * 0.9)] : 0;
   var rawTrailRef = tl.length ? Math.max(closedP90, Math.round(player.maxObservedTrail * 0.85)) : Math.max(12, player.maxObservedTrail);
-  var maxTrailEst = Math.max(10, Math.min(72, Math.round(rawTrailRef * 1.2 + 4)));
+  var maxTrailEst = Math.max(10, Math.min(72, Math.round(rawTrailRef * 1.15 + 3)));
 
   var earlyRef = player.earlyObservedTrail > 0 ? player.earlyObservedTrail : Math.min(rawTrailRef, 22);
   var lateRef = player.lateObservedTrail > 0 ? player.lateObservedTrail : rawTrailRef;
-  var earlyMaxTrailEst = Math.max(10, Math.min(60, Math.round(earlyRef * 1.15 + 3)));
-  var lateMaxTrailEst = Math.max(earlyMaxTrailEst, Math.min(72, Math.round(lateRef * 1.2 + 4)));
+  var earlyMaxTrailEst = Math.max(10, Math.min(60, Math.round(earlyRef * 1.12 + 2)));
+  var lateMaxTrailEst = Math.max(earlyMaxTrailEst, Math.min(72, Math.round(lateRef * 1.15 + 3)));
 
   var wallPref = player.totalTicks > 0 ? Math.round((player.wallTicks / player.totalTicks) * 100) / 100 : 0.35;
   var expTotal = player.stealSteps + player.neutralSteps;
@@ -2438,9 +2460,9 @@ function endRound(reason){
 
   // [DEV-LOG START]
   dlog('[END] reason=' + reason + ' tick=' + tick + ' peak=' + player.peak.toFixed(1) + '% kills=' + player.kills +
-       ' ns=' + player.ns + ' dna=(aggr=' + aggr.toFixed(2) + ',caut=' + caut.toFixed(2) + ',wall=' + wallPref +
-       ',steal=' + stealPref + ',spin=' + spinBias + ',def=' + defendPref + ',uturn=' + uturnRate +
-       ',maxTrail=' + earlyMaxTrailEst + '/' + lateMaxTrailEst + ')');
+       ' ns=' + player.ns + ' dna=(aggr=' + aggr.toFixed(2) + ',caut=' + caut.toFixed(2) + ',aw=' + awareness.toFixed(2) +
+       ',wall=' + wallPref + ',steal=' + stealPref + ',spin=' + spinBias + ',def=' + defendPref +
+       ',uturn=' + uturnRate + ',maxTrail=' + earlyMaxTrailEst + '/' + lateMaxTrailEst + ')');
   // [DEV-LOG END]
 
   var prunedModel = pruneModel(player.model);
@@ -2457,6 +2479,7 @@ function endRound(reason){
       t90: tl.length ? tl[Math.floor((tl.length - 1) * 0.9)] : maxTrailEst, kills: player.kills,
       earlyMaxTrail: earlyMaxTrailEst, lateMaxTrail: lateMaxTrailEst,
       aggr: Math.round(aggr * 100) / 100, caut: Math.round(caut * 100) / 100,
+      awareness: Math.round(awareness * 100) / 100,
       wallPref: wallPref, stealPref: stealPref, spinBias: spinBias, defendPref: defendPref, uturnRate: uturnRate,
       trips: bestTrips, t: Date.now()
     });
@@ -2537,6 +2560,7 @@ function endRound(reason){
         ns: player.ns,
         aggr: Math.round(aggr * 100) / 100,
         caut: Math.round(caut * 100) / 100,
+        awareness: Math.round(awareness * 100) / 100,
         maxTrail: maxTrailEst,
         earlyMaxTrail: earlyMaxTrailEst,
         lateMaxTrail: lateMaxTrailEst,
