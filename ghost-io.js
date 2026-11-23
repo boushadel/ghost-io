@@ -1154,7 +1154,7 @@ function policy(e){
   return 0;
 }
 
-// Evaluates candidate direction `c` for tactical safety and player-style alignment
+// Evaluates candidate direction c for tactical safety and player-style alignment
 function scoreMove(e, c, isPreferred){
   var nx = e.x + DX[c], ny = e.y + DY[c];
   if (nx < 0 || ny < 0 || nx >= W || ny >= H) return -1e9;
