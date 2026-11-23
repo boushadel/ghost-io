@@ -60,7 +60,7 @@ function clampNum(v, min, max, fallback) {
 }
 
 // ============================================================================
-// [WORKER SECTION 2] D1 & KV API ENDPOINT HANDLPERS
+// [WORKER SECTION 2] D1 & KV API ENDPOINT HANDLERS
 // Purpose: Implements /api/auth, /api/me, /api/leaderboards, /api/match,
 // /api/report (ELO + rich DNA ghost saving), and /api/ghosts/manage.
 // ============================================================================
@@ -476,10 +476,11 @@ const HTML = String.raw`<!doctype html>
   html,body{margin:0;height:100%;width:100%;position:fixed;background:#0f1220;color:#e8ebff;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;overflow:hidden;overscroll-behavior:none;touch-action:none;-webkit-user-select:none;user-select:none;-webkit-touch-callout:none;-webkit-tap-highlight-color:transparent}
   #wrap{display:flex;flex-direction:column;height:100%;height:100dvh;box-sizing:border-box;padding:env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left)}
   #hud{display:flex;gap:4px;padding:0 6px;font-size:11px;align-items:center;height:32px;flex:none;overflow:hidden}
-  #chips{display:flex;gap:4px;flex-wrap:nowrap}
+  #chips{display:flex;gap:4px;flex-wrap:nowrap;overflow:hidden}
   .chip{padding:2px 6px;border-radius:10px;background:#1b2040;border-left:5px solid #fff;white-space:nowrap}
   .me{font-weight:700;background:#262d5a}
-  #time{margin-left:auto;flex:none;font-weight:700;color:#ff5d73;font-size:14px;letter-spacing:1px}
+  #devHudBtn{margin-left:auto;flex:none;background:#1f332e;color:#59e0a0;border:1px solid #356357;border-radius:6px;font-size:11px;padding:2px 6px;min-height:22px;margin-top:0;margin-bottom:0}
+  #time{margin-left:4px;flex:none;font-weight:700;color:#ff5d73;font-size:14px;letter-spacing:1px}
   #stage{flex:1;position:relative;min-height:0}
   canvas{position:absolute;left:0;top:0;width:100%;height:100%;background:#0a0b16}
   #ov{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;background:rgba(10,12,24,.88);text-align:center;padding:12px;box-sizing:border-box;z-index:10}
@@ -514,7 +515,7 @@ const HTML = String.raw`<!doctype html>
 </head>
 <body>
 <div id="wrap">
-  <div id="hud"><div id="chips"></div><div id="time"></div></div>
+  <div id="hud"><div id="chips"></div><button id="devHudBtn" title="Copy Dev Log">📋</button><div id="time"></div></div>
   <div id="stage"><canvas id="cv"></canvas></div>
 </div>
 <div id="ov"><div id="card"></div></div>
@@ -576,16 +577,20 @@ var friendQuery = '';       // Friend username for 'friend' mode
 var challengeGhostId = 0;   // Specific ghost DB ID for 'ghost' (Revenge) mode
 var lastMatchConfig = null; // Stores parameters for instant "Play Again"
 
-// [DEV-LOG START] Temporary diagnostic logger for development debugging
+// [DEV-LOG START] Comprehensive diagnostic logger for active development
 var devLogs = [];
 function dlog(msg){
-  if (devLogs.length >= 260) devLogs.shift();
+  if (devLogs.length >= 800) devLogs.shift();
   devLogs.push('T' + tick + ' ' + msg);
 }
 function copyDevLog(btnEl){
-  var text = '=== GHOST.IO DEV LOG ===\n' + devLogs.join('\n');
+  var text = '=== GHOST.IO DEV LOG (' + devLogs.length + ' entries) ===\n' + devLogs.join('\n');
   function done(){
-    if (btnEl){ btnEl.textContent = '✅ Copied! Paste in chat'; }
+    if (btnEl){
+      var prev = btnEl.textContent;
+      btnEl.textContent = btnEl.id === 'devHudBtn' ? '✅' : '✅ Copied! Paste in chat';
+      setTimeout(function(){ if (btnEl) btnEl.textContent = prev; }, 1800);
+    }
   }
   if (navigator.clipboard && navigator.clipboard.writeText){
     navigator.clipboard.writeText(text).then(done).catch(fallbackCopy);
@@ -604,6 +609,11 @@ function copyDevLog(btnEl){
     document.body.removeChild(ta);
     done();
   }
+}
+var devHudBtn = document.getElementById('devHudBtn');
+if (devHudBtn){
+  devHudBtn.addEventListener('touchstart', function(ev){ ev.stopPropagation(); }, { passive: true });
+  devHudBtn.onclick = function(ev){ ev.stopPropagation(); copyDevLog(devHudBtn); };
 }
 // [DEV-LOG END]
 
@@ -724,8 +734,9 @@ function mk(id, name, isPlayer){
     // Trip shape recorder & playback state:
     trips: null, tpl: null, ti: 0, tc: 0, ret: false, tripOn: false,
     tseg: [], tp0: 0, tlist: [], tHunt: false, tripWall: 0, tripSteal: 0, tripSteps: 0,
+    lastPolicyAct: 0,
     // [DEV-LOG START] Per-entity diagnostic tracking
-    turnHist: [], lastReason: 'init', spinWarnedTick: -99
+    turnHist: [], lastReason: 'init', prevReason: 'init', spinWarnedTick: -99, wallStall: 0
     // [DEV-LOG END]
   };
 }
@@ -758,30 +769,37 @@ function spawn(e, force){
   }
   e.x = x; e.y = y; e.px = x; e.py = y; e.alive = true; e.born = tick;
   e.trail = []; e.pend = -1; e.since = 0; e.exit = -1; e.idle = 0; e.goal = -1;
-  e.tripOn = false; e.tpl = null; e.ret = false;
-  e.turnHist = [];
+  e.tripOn = false; e.tpl = null; e.ret = false; e.lastPolicyAct = 0;
+  e.turnHist = []; e.wallStall = 0; e.prevReason = 'spawn';
   var cx = W / 2, cy = H / 2;
   e.d = (Math.abs(cx - x) > Math.abs(cy - y)) ? (x < cx ? 0 : 2) : (y < cy ? 1 : 3);
+  // [DEV-LOG START]
+  if (tick > 0) dlog('[SPAWN] ' + e.name + ' at (' + x + ',' + y + ') d=' + e.d);
+  // [DEV-LOG END]
   return true;
 }
 
-function kill(e, by){
+function kill(e, by, cause){
   if (!e.alive) return;
+  var tLen = e.trail.length;
   e.alive = false;
-  for (var k = 0; k < e.trail.length; k++) trail[e.trail[k]] = 0;
+  for (var k = 0; k < tLen; k++) trail[e.trail[k]] = 0;
   e.trail = []; e.pend = -1; e.tripOn = false; e.deaths++;
-
-  // [DEV-LOG START]
-  dlog('[KILL] ' + e.name + ' killed by ' + (by ? by.name : '0%-land') + ' at (' + e.x + ',' + e.y + ')');
-  // [DEV-LOG END]
 
   if (e.isPlayer && by && !by.isPlayer) by.killsOnPlayer = (by.killsOnPlayer || 0) + 1;
   if (!e.isPlayer && by && by.isPlayer) e.killedByPlayer = (e.killedByPlayer || 0) + 1;
 
   var to = (by && by.alive) ? by.id : 0, moved = 0;
   for (var i = 0; i < N; i++) if (owner[i] === e.id){ owner[i] = to; moved++; }
+  var gainPct = (moved * 100 / N).toFixed(1);
+
+  // [DEV-LOG START]
+  dlog('[KILL] ' + e.name + ' killed by ' + (by ? by.name : '0%-land') +
+       ' cause=' + (cause || 'trail-cut') + ' at (' + e.x + ',' + e.y + ') trailLen=' + tLen + ' land=' + gainPct + '%');
+  // [DEV-LOG END]
+
   if (to && by.isPlayer){
-    toast.msg = '+' + (moved * 100 / N).toFixed(1) + '% from ' + e.name;
+    toast.msg = '+' + gainPct + '% from ' + e.name;
     toast.until = tick + 25;
   }
   e.respawn = tick + 30; e.wait = 0;
@@ -805,17 +823,22 @@ function fill(id){
     if (x > 0) push(i - 1); if (x < W - 1) push(i + 1);
     if (y > 0) push(i - W); if (y < H - 1) push(i + W);
   }
-  for (var j = 0; j < N; j++) if (!seen[j] && owner[j] !== id) owner[j] = id;
+  var enclosed = 0;
+  for (var j = 0; j < N; j++) if (!seen[j] && owner[j] !== id){ owner[j] = id; enclosed++; }
+  return enclosed;
 }
 
 function closeLoop(e){
   var tLen = e.trail.length;
+  var prevPct = e.pct;
   if (e.isPlayer){ tripSum += tLen; tripN++; trips.push(tLen); }
   for (var k = 0; k < tLen; k++){ owner[e.trail[k]] = e.id; trail[e.trail[k]] = 0; }
   e.trail = [];
-  fill(e.id);
+  var enclosed = fill(e.id);
   // [DEV-LOG START]
-  if (tLen >= 6) dlog('[LOOP] ' + e.name + ' closed trail=' + tLen);
+  var totalCells = tLen + enclosed;
+  var gainPct = (totalCells * 100 / N).toFixed(1);
+  if (tLen >= 4) dlog('[LOOP] ' + e.name + ' trail=' + tLen + ' enclosed=' + enclosed + ' (+' + gainPct + '% from ' + prevPct.toFixed(1) + '%)');
   // [DEV-LOG END]
 }
 
@@ -832,9 +855,17 @@ function commit(){
 function move(e){
   if (!e.alive) return;
   var ox = e.x, oy = e.y, nx = ox + DX[e.d], ny = oy + DY[e.d];
-  if (nx < 0 || ny < 0 || nx >= W || ny >= H){ e.px = ox; e.py = oy; return; }
+  if (nx < 0 || ny < 0 || nx >= W || ny >= H){
+    e.px = ox; e.py = oy;
+    // [DEV-LOG START]
+    e.wallStall++;
+    if (e.wallStall === 3) dlog('[WALL-STALL] ' + e.name + ' hitting border at (' + ox + ',' + oy + ') d=' + e.d + ' reason=' + e.lastReason);
+    // [DEV-LOG END]
+    return;
+  }
+  e.wallStall = 0;
   var i = ny * W + nx, t = trail[i];
-  if (t && t !== e.id){ kill(byId(t), e); e.kills++; }
+  if (t && t !== e.id){ kill(byId(t), e, 'trail-cut'); e.kills++; }
   e.px = ox; e.py = oy; e.x = nx; e.y = ny;
   if (owner[i] === e.id){
     if (e.trail.length) closeLoop(e);
@@ -854,9 +885,9 @@ function resolveHeadOn(){
     a = ents[i]; b = ents[j];
     if (!a.alive || !b.alive) continue;
     if (nx[i] === nx[j] || (nx[i] === b.y * W + b.x && nx[j] === a.y * W + a.x)){
-      if (a.pct > b.pct){ kill(b, a); a.kills++; }
-      else if (b.pct > a.pct){ kill(a, b); b.kills++; }
-      else { kill(a); kill(b); }
+      if (a.pct > b.pct){ kill(b, a, 'head-on(' + a.pct.toFixed(1) + '>' + b.pct.toFixed(1) + ')'); a.kills++; }
+      else if (b.pct > a.pct){ kill(a, b, 'head-on(' + b.pct.toFixed(1) + '>' + a.pct.toFixed(1) + ')'); b.kills++; }
+      else { kill(a, null, 'head-on-tie'); kill(b, null, 'head-on-tie'); }
     }
   }
 }
@@ -869,7 +900,7 @@ function recount(){
     var e = ents[i];
     e.pct = c[e.id] * 100 / N;
     if (e.pct > e.peak) e.peak = e.pct;
-    if (e.alive && c[e.id] === 0 && tick > 3) kill(e);
+    if (e.alive && c[e.id] === 0 && tick > 3) kill(e, null, '0%-land');
   }
 }
 
@@ -1141,23 +1172,29 @@ function hunt(e){
   return best;
 }
 
+// Frontier-aware expansion goal picker: targets unowned cells right along e's border
 function pickGoal(e){
   var best = -1, bestScore = -1e9;
   var wantWall = e.wallPref != null ? e.wallPref : 0.35;
   var wantSteal = e.stealPref != null ? e.stealPref : 0.3;
 
-  for (var t = 0; t < 45; t++){
+  for (var t = 0; t < 80; t++){
     var i = rnd(N), x = i % W, y = (i / W) | 0;
     if (owner[i] === e.id || x <= 1 || y <= 1 || x >= W - 2 || y >= H - 2) continue;
+    var adjOwn = (x > 0 && owner[i - 1] === e.id) ||
+                 (x < W - 1 && owner[i + 1] === e.id) ||
+                 (y > 0 && owner[i - W] === e.id) ||
+                 (y < H - 1 && owner[i + W] === e.id);
     var dist = Math.abs(x - e.x) + Math.abs(y - e.y);
-    if (dist < 4 || dist > 38) continue;
+    if (dist < 2 || dist > 48) continue;
 
     var wd = Math.min(x, W - 1 - x, y, H - 1 - y);
     var isEdge = wd <= 5 ? 1 : 0;
     var isRival = owner[i] > 0 ? 1 : 0;
-    var sc = (isEdge ? wantWall * 14 : (1 - wantWall) * 8) +
+    var sc = (adjOwn ? 20 : 0) +
+             (isEdge ? wantWall * 14 : (1 - wantWall) * 8) +
              (isRival ? wantSteal * 14 : (1 - wantSteal) * 6) -
-             dist * 0.25 + Math.random() * 4;
+             dist * 0.3 + Math.random() * 4;
     if (sc > bestScore){ bestScore = sc; best = i; }
   }
   return best;
@@ -1165,20 +1202,33 @@ function pickGoal(e){
 
 function policy(e){
   var ks = ctxKeys(e), c, t, r, a;
+  var home = owner[e.y * W + e.x] === e.id;
   for (var l = 0; l < 5; l++){
     c = e.model[ks[l]];
     if (!c) continue;
     t = c[0] + c[1] + c[2] + c[3];
     if (t >= MINS || l === 4){
       r = Math.random() * t;
-      for (a = 0; a < 4; a++){ r -= c[a]; if (r < 0) return a; }
+      for (a = 0; a < 4; a++){
+        r -= c[a];
+        if (r < 0){
+          // Prevent consecutive same-way turns inside home territory (eliminates 2x2 loops)
+          if (home && e.since <= 2 && (a === 1 || a === 3) && a === e.lastPolicyAct) return 0;
+          e.lastPolicyAct = a;
+          return a;
+        }
+      }
+      e.lastPolicyAct = 0;
       return 0;
     }
   }
-  if (Math.random() < 0.12){
+  if (Math.random() < 0.12 && (!home || e.since > 2)){
     var bias = e.spinBias != null ? e.spinBias : 0;
-    return Math.random() < (0.5 + bias * 0.35) ? 1 : 3;
+    var chosen = Math.random() < (0.5 + bias * 0.35) ? 1 : 3;
+    e.lastPolicyAct = chosen;
+    return chosen;
   }
+  e.lastPolicyAct = 0;
   return 0;
 }
 
@@ -1192,7 +1242,7 @@ function scoreMove(e, c, isPreferred){
   var sc = isPreferred ? 50 : 0;
 
   if (e.ret && len > 0 && owner[idx] === e.id) sc += 35;
-  if (trail[idx] === e.id && !(e.ret && owner[idx] === e.id)) sc -= 14;
+  if (trail[idx] === e.id && !(e.ret && owner[idx] === e.id)) sc -= 32;
 
   for (var n = 0; n < ents.length; n++){
     var o = ents[n];
@@ -1240,7 +1290,7 @@ function ghostDecide(e){
     target = h; e.tpl = null; e.ret = true; e.goal = -1; reason = 'hunt';
   } else if (e.ret){
     target = safestOwn(e); reason = 'retreat';
-  } else if (!out && e.idle > 12){
+  } else if (!out && e.idle > 10){
     if (e.goal < 0 || owner[e.goal] === e.id) e.goal = pickGoal(e);
     target = e.goal; reason = 'goal';
   } else {
@@ -1291,7 +1341,13 @@ function ghostDecide(e){
   if (e.d !== d) e.since = 0;
   e.since++;
 
-  // [DEV-LOG START] Detect spinning inside own territory
+  // [DEV-LOG START] Log key AI state transitions and anomalies
+  if (reason !== e.prevReason && (reason === 'hunt' || reason === 'retreat' || reason === 'goal' || reason === 'trip')){
+    var tInfo = target >= 0 ? ('->(' + (target % W) + ',' + ((target / W) | 0) + ')') : '';
+    dlog('[AI-MODE] ' + e.name + ' ' + e.prevReason + '->' + reason + tInfo + ' at (' + e.x + ',' + e.y + ') trail=' + len);
+  }
+  e.prevReason = reason;
+
   if (e.d !== d){
     e.turnHist.push(tick);
     if (e.turnHist.length > 5) e.turnHist.shift();
@@ -1299,12 +1355,11 @@ function ghostDecide(e){
       e.spinWarnedTick = tick;
       var tStr = target >= 0 ? ('(' + (target % W) + ',' + ((target / W) | 0) + ')') : 'none';
       dlog('[SPIN] ' + e.name + ' pos=(' + e.x + ',' + e.y + ') idle=' + e.idle + ' reason=' + reason +
-           ' prefs=[' + prefs.join(',') + '] d=' + e.d + ' target=' + tStr + ' spinBias=' + e.spinBias +
-           ' hasModel=' + (e.model ? 1 : 0) + ' trips=' + (e.trips ? e.trips.length : 0));
+           ' prefs=[' + prefs.join(',') + '] d=' + e.d + ' target=' + tStr + ' spinBias=' + e.spinBias);
     }
   }
-  if (!out && e.idle === 25){
-    dlog('[IDLE] ' + e.name + ' idle=25 pos=(' + e.x + ',' + e.y + ') reason=' + reason + ' goal=' + e.goal);
+  if (!out && e.idle === 35){
+    dlog('[LONG-IDLE] ' + e.name + ' idle=35 pos=(' + e.x + ',' + e.y + ') pct=' + e.pct.toFixed(1) + '% reason=' + reason + ' goal=' + e.goal);
   }
   // [DEV-LOG END]
 }
@@ -1433,7 +1488,14 @@ function resize(){
 function turn(nd){
   var lastD = q.length ? q[q.length - 1] : (player ? player.d : 0);
   if (nd === lastD) return;
-  if (q.length < 2) q.push(nd);
+  if (q.length < 2){
+    q.push(nd);
+    // [DEV-LOG START]
+    if (player && player.alive){
+      dlog('[INPUT] turn->' + nd + ' at (' + player.x + ',' + player.y + ') trail=' + player.trail.length);
+    }
+    // [DEV-LOG END]
+  }
 }
 
 function playerDecide(p){
@@ -1443,6 +1505,7 @@ function playerDecide(p){
   if (turned){ p.d = nd; p.since = 0; }
   p.since++;
   track(p);
+  p.lastReason = (owner[p.y * W + p.x] === p.id) ? 'home' : 'out(' + p.trail.length + ')';
 }
 
 function updateHud(){
@@ -1478,6 +1541,9 @@ function step(){
           if (e.isPlayer){ q = []; e.since = 0; }
         } else {
           e.respawn = tick + 5; e.wait += 5;
+          // [DEV-LOG START]
+          if (e.wait === 15) dlog('[SPAWN-FAIL] ' + e.name + ' waiting for free room (' + e.wait + ' ticks)');
+          // [DEV-LOG END]
           if (e.isPlayer && e.wait >= 30) endRound('noroom');
         }
       }
@@ -1497,7 +1563,7 @@ function step(){
   if (tick % 50 === 0){
     var snap = ents.map(function(en){
       var isOut = en.alive && owner[en.y * W + en.x] !== en.id ? 1 : 0;
-      return en.name + ':' + (en.alive ? (en.pct.toFixed(1) + '%@(' + en.x + ',' + en.y + ')out=' + isOut + ',idle=' + en.idle + ',r=' + en.lastReason) : 'DEAD');
+      return en.name + ':' + (en.alive ? (en.pct.toFixed(1) + '%@(' + en.x + ',' + en.y + ')d=' + en.d + ',out=' + isOut + ',t=' + en.trail.length + ',idle=' + en.idle + ',r=' + en.lastReason) : 'DEAD');
     }).join(' | ');
     dlog('[SNAP] ' + snap);
   }
@@ -1630,11 +1696,12 @@ function initArenaWithGhosts(cloudGhosts){
 
   // [DEV-LOG START] Log initial roster & DNA configuration
   dlog('[START] user=' + myName + ' loggedIn=' + (currentUser ? 1 : 0) + ' mode=' + (lastMatchConfig ? lastMatchConfig.mode : gameMode));
-  for (var di = 1; di < ents.length; di++){
+  for (var di = 0; di < ents.length; di++){
     var de = ents[di];
-    dlog('[ENT] ' + de.name + ' pos=(' + de.x + ',' + de.y + ') badge=' + de.badge +
+    dlog('[ENT] ' + de.name + ' pos=(' + de.x + ',' + de.y + ') d=' + de.d + ' badge=' + de.badge +
          ' model=' + (de.model ? Object.keys(de.model).length : 0) + ' trips=' + (de.trips ? de.trips.length : 0) +
-         ' aggr=' + de.aggr + ' caut=' + de.caut + ' spinBias=' + de.spinBias + ' maxTrail=' + de.maxTrail);
+         ' aggr=' + de.aggr + ' caut=' + de.caut + ' wall=' + de.wallPref + ' steal=' + de.stealPref +
+         ' spin=' + de.spinBias + ' def=' + de.defendPref + ' maxTrail=' + de.maxTrail);
   }
   // [DEV-LOG END]
 
@@ -1647,6 +1714,7 @@ function initArenaWithGhosts(cloudGhosts){
 
 // --- Screen 1: Main Start Lobby ---
 function showStart(){
+  if (gameMode === 'ghost') gameMode = 'others';
   var accountBar = '';
   if (currentUser){
     accountBar = '<div class="bar">' +
@@ -1895,10 +1963,6 @@ function endRound(reason){
   running = false;
   draw(1); updateHud();
 
-  // [DEV-LOG START]
-  dlog('[END] reason=' + reason + ' tick=' + tick + ' playerPeak=' + player.peak.toFixed(1) + '%');
-  // [DEV-LOG END]
-
   var tl = trips.slice().sort(function(a, b){ return a - b; });
   var cs = player.chT + player.chA;
   var aggr = cs >= 20 ? Math.max(0.15, Math.min(0.92, (player.chT / cs - 0.38) / 0.42)) : Math.min(0.9, 0.3 + player.kills * 0.12);
@@ -1914,6 +1978,12 @@ function endRound(reason){
   var defTotal = player.defT + player.defA;
   var defendPref = defTotal >= 6 ? Math.round((player.defT / defTotal) * 100) / 100 : 0.5;
   var uturnRate = player.ns > 0 ? Math.round((player.uturns / player.ns) * 1000) / 1000 : 0.03;
+
+  // [DEV-LOG START]
+  dlog('[END] reason=' + reason + ' tick=' + tick + ' peak=' + player.peak.toFixed(1) + '% kills=' + player.kills +
+       ' ns=' + player.ns + ' dna=(aggr=' + aggr.toFixed(2) + ',caut=' + caut.toFixed(2) + ',wall=' + wallPref +
+       ',steal=' + stealPref + ',spin=' + spinBias + ',def=' + defendPref + ',maxTrail=' + maxTrailEst + ')');
+  // [DEV-LOG END]
 
   var prunedModel = pruneModel(player.model);
   var bestTrips = keepTrips(player.tlist);
@@ -2018,6 +2088,12 @@ function endRound(reason){
       }
     }
   }).then(function(res){
+    // [DEV-LOG START]
+    dlog('[API-SYNC] ok=' + (res && res.ok ? 1 : 0) + ' delta=' + (res ? res.playerDelta : 0) + ' msg="' + (res ? res.ghostMsg : '') + '"');
+    var endBtn = document.getElementById('copyLogEnd');
+    if (endBtn) endBtn.textContent = '📋 Copy Dev Log (' + devLogs.length + ')';
+    // [DEV-LOG END]
+
     var st = document.getElementById('syncStatus');
     if (!st) return;
     if (!res || !res.ok){
@@ -2035,6 +2111,9 @@ function endRound(reason){
     else if (player.ns < 40) lines.push('Round too short to clone a ghost (need 40+ moves).');
     st.innerHTML = lines.join('<br>') || 'Results synced!';
   }).catch(function(){
+    // [DEV-LOG START]
+    dlog('[API-SYNC] network-error');
+    // [DEV-LOG END]
     var st = document.getElementById('syncStatus');
     if (st) st.textContent = 'Saved locally (network unavailable).';
   });
