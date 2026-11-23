@@ -49,6 +49,12 @@
 //               ghosts, and reckless/overextending players produce reckless ghosts.
 //               Fallback `BOT-N` fillers must play clean baseline loops without
 //               pathfinding bugs (no 100-tile straight-line stalls or 2x2 spins).
+//   - [RULE-09] Unrestricted 180-Degree U-Turns & Phase-Scaled Loops: Never block
+//               or heavily penalize 180-degree U-turns onto an entity's own trail
+//               (stepping on own trail is safe in Ghost.io rules and is a core
+//               human cutback maneuver). Track and replay early-game vs late-game
+//               loop sizing (`earlyMaxTrail` vs `lateMaxTrail`) so ghosts scale
+//               their loop ambition dynamically with territory percentage.
 //
 // [C] SYSTEM ARCHITECTURE & DATABASE SCHEMA REFERENCE
 // ----------------------------------------------------------------------------
@@ -380,6 +386,8 @@ async function handleMatch(request, env) {
         aggr: r.aggr,
         caut: r.caut,
         maxTrail: r.max_trail,
+        earlyMaxTrail: brain?.earlyMaxTrail ?? Math.min(r.max_trail, 26),
+        lateMaxTrail: brain?.lateMaxTrail ?? r.max_trail,
         wallPref: brain?.wallPref ?? 0.35,
         stealPref: brain?.stealPref ?? 0.3,
         spinBias: brain?.spinBias ?? 0,
@@ -420,6 +428,8 @@ async function handleReport(request, env) {
   const aggr = Math.round(clampNum(round.aggr, 0.1, 0.95, 0.4) * 100) / 100;
   const caut = Math.round(clampNum(round.caut, 0.1, 0.95, 0.4) * 100) / 100;
   const maxTrail = Math.round(clampNum(round.maxTrail, 10, 80, 20));
+  const earlyMaxTrail = Math.round(clampNum(round.earlyMaxTrail, 10, 72, Math.min(maxTrail, 24)));
+  const lateMaxTrail = Math.round(clampNum(round.lateMaxTrail, 10, 80, maxTrail));
   const wallPref = Math.round(clampNum(round.wallPref, 0, 1, 0.35) * 100) / 100;
   const stealPref = Math.round(clampNum(round.stealPref, 0, 1, 0.3) * 100) / 100;
   const spinBias = Math.round(clampNum(round.spinBias, -1, 1, 0) * 100) / 100;
@@ -540,6 +550,8 @@ async function handleReport(request, env) {
       const brainPayload = JSON.stringify({
         model: round.model,
         trips: Array.isArray(round.trips) ? round.trips.slice(0, 40) : [],
+        earlyMaxTrail,
+        lateMaxTrail,
         wallPref,
         stealPref,
         spinBias,
@@ -898,17 +910,17 @@ function mk(id, name, isPlayer){
     // Cloud metadata & combat telemetry for ELO calculation:
     dbId: 0, badge: '', elo: 1000, killsOnPlayer: 0, killedByPlayer: 0,
     // 6-axis Behavioral Cloning DNA traits (loaded from KV for ghosts, or default for bots):
-    script: null, si: 0, sc: 0, maxTrail: 20, aggr: 0.4, caut: 0.3,
+    script: null, si: 0, sc: 0, maxTrail: 20, earlyMaxTrail: 20, lateMaxTrail: 20, aggr: 0.4, caut: 0.3,
     wallPref: 0.35, stealPref: 0.3, spinBias: 0, defendPref: 0.5, uturnRate: 0.03,
     // Real-time single-round player telemetry accumulators (recorded only when isPlayer === true):
     idle: 0, goal: -1, since: 0, pend: -1, model: null, ns: 0,
     chT: 0, chA: 0, fT: 0, fA: 0,
     wallTicks: 0, totalTicks: 0, stealSteps: 0, neutralSteps: 0,
     rightTurns: 0, leftTurns: 0, uturns: 0, defT: 0, defA: 0,
-    // FIX RATIONALE [RULE-08]: Tracks the longest exposed trail the player reached during
-    // the round even if they died before closing a loop, so reckless players who die
-    // overextending still produce reckless ghosts with high `maxTrail`.
-    maxObservedTrail: 0,
+    // FIX RATIONALE [RULE-08] & [RULE-09]: Tracks overall max observed trail plus
+    // early-round (<20% land) vs late-round (>=20% land) trail peaks so ghosts mirror
+    // how the player scales loop size as they gain map control.
+    maxObservedTrail: 0, earlyObservedTrail: 0, lateObservedTrail: 0,
     // Geometric loop ("trip") recorder & playback state:
     trips: null, tpl: null, ti: 0, tc: 0, ret: false, tripOn: false,
     tseg: [], tp0: 0, tlist: [], tHunt: false, tripWall: 0, tripSteal: 0, tripSteps: 0,
@@ -1138,7 +1150,7 @@ function recount(){
 //   2. Geometric loop templates (`tripTrack` / `keepTrips`) scored by area gain
 //      and step efficiency.
 //   3. 6 continuous behavioral DNA traits (`aggr`, `caut`, `wallPref`, `stealPref`,
-//      `spinBias`, `defendPref`) that faithfully mirror the player's skill ([RULE-08]).
+//      `spinBias`, `defendPref`) plus phase-scaled loop limits ([RULE-08]/[RULE-09]).
 // ============================================================================
 
 /**
@@ -1172,14 +1184,11 @@ function minEnemyDistToTrail(e){
 
 /**
  * Builds a 5-level hierarchical array of context keys (from ultra-specific level 0
- * down to coarse level 4) representing the entity's immediate tactical state:
- *   - `lb`      : trail length bucket (0 = inside home land, 1..6 = trail length tiers)
- *   - `hs`      : egocentric sector toward home exit cell
- *   - `wl`      : 1 if outer arena wall is within 2 steps ahead
- *   - `danger`  : 2 if an enemy can reach `e`'s trail faster than `e` can return home
- *   - `onEnemy` : 1 if currently carving inside a rival's territory
- *   - `thr`     : nearest threat type (head vs trail), distance band, and sector
- *   - `rb`      : run-length bucket of ticks since last turn
+ * down to coarse level 4) representing the entity's immediate tactical state.
+ * FIX RATIONALE [RULE-09]: Uses `nearestOwn(e)` instead of `e.exit` for the home
+ * return sector `hs` and home distance `hd`, and encodes territory phase (`pctPhase`)
+ * so the ghost accurately mirrors how the player closes loops toward the nearest
+ * border and scales aggression/loop size from early game to late game.
  */
 function ctxKeys(e){
   var cellIdx = e.y * W + e.x;
@@ -1187,7 +1196,9 @@ function ctxKeys(e){
   var onEnemy = (!home && owner[cellIdx] > 0) ? 1 : 0;
   var len = e.trail.length + (e.pend >= 0 ? 1 : 0);
   var lb = home ? 0 : len <= 2 ? 1 : len <= 6 ? 2 : len <= 12 ? 3 : len <= 20 ? 4 : len <= 30 ? 5 : 6;
-  var hs = (!home && e.exit >= 0) ? sector(e, e.exit % W - e.x, ((e.exit / W) | 0) - e.y) : 0;
+  var nearCell = !home ? nearestOwn(e) : -1;
+  var hs = nearCell >= 0 ? sector(e, (nearCell % W) - e.x, ((nearCell / W) | 0) - e.y) : 0;
+  var pctPhase = e.pct < 15 ? 0 : e.pct < 40 ? 1 : 2;
 
   var wallDist = Math.min(e.x, W - 1 - e.x, e.y, H - 1 - e.y);
   var nearWall = wallDist <= 3 ? 1 : 0;
@@ -1205,15 +1216,15 @@ function ctxKeys(e){
   }
 
   var td = home ? 99 : minEnemyDistToTrail(e);
-  var hd = (!home && e.exit >= 0) ? (Math.abs(e.exit % W - e.x) + Math.abs(((e.exit / W) | 0) - e.y)) : 0;
+  var hd = nearCell >= 0 ? (Math.abs((nearCell % W) - e.x) + Math.abs(((nearCell / W) | 0) - e.y)) : 0;
   var danger = (!home && td <= hd + 1 && td <= 7) ? 2 : (!home && td <= 5) ? 1 : 0;
 
   var thr = bd > 8 ? 0 : 1 + kind * 8 + (bd <= 3 ? 0 : 4) + sector(e, sx - e.x, sy - e.y), tp = thr ? 1 : 0;
   var s = e.since, rb = s <= 1 ? 0 : s <= 4 ? s - 1 : s <= 6 ? 4 : s <= 8 ? 5 : s <= 11 ? 6 : s <= 15 ? 7 : s <= 22 ? 8 : 9;
 
   return [
-    '0' + lb + hs + wl + danger + onEnemy + thr.toString(36) + rb,
-    '1' + lb + hs + danger + nearWall + rb,
+    '0' + lb + hs + wl + danger + onEnemy + pctPhase + thr.toString(36) + rb,
+    '1' + lb + hs + danger + nearWall + pctPhase + rb,
     '2' + lb + hs + tp + danger,
     '3' + lb + rb,
     '4' + (lb ? 1 : 0)
@@ -1280,13 +1291,19 @@ function keepTrips(list){
 /**
  * Accumulates continuous behavioral telemetry on every tick to estimate the
  * player's high-level traits: Aggression (`chT/chA`), Caution (`fT/fA`),
- * Wall Preference, Steal Preference, and Home Defense (`defT/defA`).
+ * Wall Preference, Steal Preference, Home Defense (`defT/defA`), and phase-scaled
+ * trail lengths (`earlyObservedTrail` vs `lateObservedTrail`).
  */
 function track(p){
   var cellIdx = p.y * W + p.x;
   var out = owner[cellIdx] !== p.id;
   var curTrail = p.trail.length + (p.pend >= 0 ? 1 : 0);
   if (curTrail > p.maxObservedTrail) p.maxObservedTrail = curTrail;
+  if (p.pct < 20){
+    if (curTrail > p.earlyObservedTrail) p.earlyObservedTrail = curTrail;
+  } else {
+    if (curTrail > p.lateObservedTrail) p.lateObservedTrail = curTrail;
+  }
 
   p.totalTicks++;
   if (Math.min(p.x, W - 1 - p.x, p.y, H - 1 - p.y) <= 4) p.wallTicks++;
@@ -1347,8 +1364,8 @@ function headNear(e){
 //      (`safestOwn`), and frontier-seeking expansion (`pickGoal`).
 //   2. Style Cloning: Context-matched loop playback (`pickTrip`) and 5-level
 //      hierarchical policy sampling (`policy`).
-//   3. Lookahead Safety Scorer (`scoreMove`): Prevents self-trail collisions,
-//      border stalls, head-on losses, and 2x2 spinning loops.
+//   3. Lookahead Safety Scorer (`scoreMove`): Supports 180-degree U-turns,
+//      prevents border stalls, head-on losses, and 2x2 spinning loops.
 // ============================================================================
 function safe(e, c){
   var nx = e.x + DX[c], ny = e.y + DY[c];
@@ -1361,47 +1378,37 @@ function okCell(e, c){
 }
 
 /**
- * Greedy Manhattan router toward cell index `t`.
- * FIX RATIONALE [RULE-08]: Previously, when target `t` was directly behind `e`
- * (`rem <= 0 && side === 0`), `side !== 0` skipped the turn check and the fallback
- * loop penalized turns by `+0.5` while straight-away movement had `0` turn penalty,
- * causing bots/ghosts in `retreat` mode to walk straight AWAY from home for 70-120
- * tiles until hitting the arena wall (`BOT-2` & `BOT-3` bug in dev logs).
- * Now:
- *   1. When `rem <= 0 && side === 0`, immediately picks a 90-degree turn (left or
- *      right, favoring whichever side has no own trail and more room to turn around).
- *   2. In the fallback loop, moving straight when `rem <= 0` receives a `+2.5`
- *      wrong-way penalty so `goTo` never walks straight away from its target.
+ * Greedy Manhattan router toward cell index `t` with full 180-degree U-turn support.
+ * FIX RATIONALE [RULE-09]: Previously `goTo` only considered `[d, (d+1)%4, (d+3)%4]`
+ * and excluded `(d+2)%4` (180-degree U-turn), causing `Boo#2` on the top wall (`y=0`)
+ * with its trail at `y=1` to walk 122 tiles around the perimeter instead of U-turning
+ * 180 degrees back to its territory. Now:
+ *   1. When target `t` is directly behind (`rem <= 0 && side === 0`), allows immediate
+ *      180-degree U-turn `(d + 2) % 4` (since stepping on own trail is safe in Ghost.io).
+ *   2. Evaluates all 4 directions (`0, 1, 2, 3`) with only a tiny own-trail preference
+ *      when NOT retreating (`!e.ret`), so retreating ghosts freely double back 180°
+ *      along their trail to reach safety.
  */
 function goTo(e, t){
   var tx = t % W, ty = (t / W) | 0, best = -1, bs = 1e9, k, c, nx, ny, sc, d = e.d, ex = tx - e.x, ey = ty - e.y;
   var rem = (d % 2 === 0) ? ex * DX[d] : ey * DY[d];
   var side = (d % 2 === 0) ? ey : ex;
   if (rem > 0 && okCell(e, d)) return d;
+  if (rem <= 0 && side === 0){
+    var uDir = (d + 2) % 4;
+    if (safe(e, uDir)) return uDir;
+  }
   if (rem <= 0 && side !== 0){
     c = (d % 2 === 0) ? (side > 0 ? 1 : 3) : (side > 0 ? 0 : 2);
     if (okCell(e, c)) return c;
   }
-  if (rem <= 0 && side === 0){
-    var rDir = (d + 1) % 4, lDir = (d + 3) % 4;
-    var rOk = okCell(e, rDir), lOk = okCell(e, lDir);
-    if (rOk && !lOk) return rDir;
-    if (lOk && !rOk) return lDir;
-    if (rOk && lOk){
-      // Pick the side with more space toward arena center so the U-turn arc doesn't hit a wall
-      var rx = e.x + DX[rDir], ry = e.y + DY[rDir];
-      var lx = e.x + DX[lDir], ly = e.y + DY[lDir];
-      var rCenterDist = Math.abs(rx - W / 2) + Math.abs(ry - H / 2);
-      var lCenterDist = Math.abs(lx - W / 2) + Math.abs(ly - H / 2);
-      return rCenterDist <= lCenterDist ? rDir : lDir;
-    }
-  }
-  for (k = 0; k < 3; k++){
-    c = (e.d + (k === 0 ? 0 : k === 1 ? 1 : 3)) % 4;
+  for (k = 0; k < 4; k++){
+    c = (e.d + k) % 4;
     nx = e.x + DX[c]; ny = e.y + DY[c];
     if (nx < 0 || ny < 0 || nx >= W || ny >= H) continue;
-    var wrongWayPen = (k === 0 && rem <= 0) ? 2.5 : (k ? 0.5 : 0);
-    sc = Math.abs(tx - nx) + Math.abs(ty - ny) + (trail[ny * W + nx] === e.id ? 6 : 0) + wrongWayPen;
+    var wrongWayPen = (k === 0 && rem <= 0) ? 2.5 : (k ? 0.4 : 0);
+    var ownTrailPen = (!e.ret && trail[ny * W + nx] === e.id) ? 1.5 : 0;
+    sc = Math.abs(tx - nx) + Math.abs(ty - ny) + ownTrailPen + wrongWayPen;
     if (sc < bs){ bs = sc; best = c; }
   }
   return best;
@@ -1418,22 +1425,26 @@ function nearestOwn(e){
 }
 
 /**
- * Finds the safest home territory cell to retreat to by adding a proximity
- * penalty (`(5 - ed) * 4`) to any home cell within 4 tiles of a rival head,
- * preventing retreating ghosts from running straight into an ambush.
+ * Finds the safest home territory cell to retreat to by penalizing both:
+ *   1. Home cells within 4 tiles of a rival head (`(5 - ed) * 4`), AND
+ *   2. Retreat paths whose midpoint passes within 3 tiles of a rival head (`+14`),
+ *      preventing retreating ghosts from running across an enemy's strike path.
  */
 function safestOwn(e){
-  var best = -1, bs = 1e9, i, cx, cy, d, n, o, ed, pen;
+  var best = -1, bs = 1e9, i, cx, cy, mx, my, d, n, o, ed, md, pen;
   for (i = 0; i < N; i++){
     if (owner[i] !== e.id) continue;
     cx = i % W; cy = (i / W) | 0;
     d = Math.abs(cx - e.x) + Math.abs(cy - e.y);
+    mx = (cx + e.x) >> 1; my = (cy + e.y) >> 1;
     pen = 0;
     for (n = 0; n < ents.length; n++){
       o = ents[n];
       if (o === e || !o.alive) continue;
       ed = Math.abs(o.x - cx) + Math.abs(o.y - cy);
       if (ed <= 4) pen += (5 - ed) * 4;
+      md = Math.abs(o.x - mx) + Math.abs(o.y - my);
+      if (md <= 3) pen += (4 - md) * 5;
     }
     if (d + pen < bs){ bs = d + pen; best = i; }
   }
@@ -1529,9 +1540,9 @@ function pickGoal(e){
 /**
  * Samples a relative turn action (`0=straight, 1=right, 2=uturn, 3=left`) from the
  * most specific context bucket in `e.model` that has at least `MINS` (6) samples.
- * FIX RATIONALE: Inside home territory (`home === true`), blocks repeating the
- * exact same 90-degree turn (`a === e.lastPolicyAct`) within 2 ticks so stochastic
- * policy draws cannot trap a ghost in a tight 2x2 circle.
+ * FIX RATIONALE [RULE-09]: Uses the player's recorded `e.uturnRate` in fallback
+ * sampling so ghosts naturally perform 180-degree cutbacks at the player's own rate,
+ * while blocking repeated identical 90-degree turns inside home land to prevent 2x2 spins.
  */
 function policy(e){
   var ks = ctxKeys(e), c, t, r, a;
@@ -1554,6 +1565,10 @@ function policy(e){
       return 0;
     }
   }
+  if (home && e.since > 3 && Math.random() < (e.uturnRate || 0.03)){
+    e.lastPolicyAct = 2;
+    return 2;
+  }
   if (Math.random() < 0.12 && (!home || e.since > 2)){
     var bias = e.spinBias != null ? e.spinBias : 0;
     var chosen = Math.random() < (0.5 + bias * 0.35) ? 1 : 3;
@@ -1566,10 +1581,10 @@ function policy(e){
 
 /**
  * Evaluates candidate direction `c` for tactical safety and Style DNA alignment.
- * FIX RATIONALE: Awards `+2.0` straight-line momentum (`rel === 0`) so that when
- * `prefs` is empty (no active turn command), `spinBias` (`+-0.6` max) acts only
- * as a tie-breaker during turns rather than outscoring straight movement (`0`)
- * and forcing the ghost to turn 90 degrees every single tick in a 2x2 loop.
+ * FIX RATIONALE [RULE-09]: Removed the `-32` own-trail penalty that previously blocked
+ * 180-degree U-turns onto an entity's own trail (stepping on own trail is completely
+ * safe in Ghost.io physics). Applies only a tiny `-1.5` spread bias when expanding
+ * (`!e.ret`), and `0` penalty when retreating (`e.ret`) or following a preferred U-turn.
  */
 function scoreMove(e, c, isPreferred){
   var nx = e.x + DX[c], ny = e.y + DY[c];
@@ -1580,7 +1595,7 @@ function scoreMove(e, c, isPreferred){
   var sc = isPreferred ? 50 : 0;
 
   if (e.ret && len > 0 && owner[idx] === e.id) sc += 35;
-  if (trail[idx] === e.id && !(e.ret && owner[idx] === e.id)) sc -= 32;
+  if (!e.ret && trail[idx] === e.id) sc -= 1.5;
 
   for (var n = 0; n < ents.length; n++){
     var o = ents[n];
@@ -1605,12 +1620,27 @@ function scoreMove(e, c, isPreferred){
 }
 
 /**
+ * Computes the ghost's current effective trail limit by interpolating between
+ * `earlyMaxTrail` (when `pct < 15%`) and `lateMaxTrail` (when `pct >= 35%`),
+ * mirroring how human players play tightly early on and take huge sweeps when dominant.
+ */
+function effectiveMaxTrail(e){
+  var early = e.earlyMaxTrail != null ? e.earlyMaxTrail : Math.min(e.maxTrail, 26);
+  var late = e.lateMaxTrail != null ? e.lateMaxTrail : e.maxTrail;
+  if (e.pct <= 15) return early;
+  if (e.pct >= 35) return late;
+  var t = (e.pct - 15) / 20;
+  return Math.round(early + (late - early) * t);
+}
+
+/**
  * Master per-tick decision pipeline for every AI ghost:
- *   1. Evaluates loop safety (`maxTrail`, trail interception danger, nearby heads)
- *      to decide whether to switch into retreat mode (`e.ret = true`).
+ *   1. Evaluates dynamic loop safety (`effectiveMaxTrail`, trail interception danger,
+ *      nearby heads) to decide whether to switch into retreat mode (`e.ret = true`).
  *   2. Priority hierarchy: `hunt` > `retreat` > `idle > 10` frontier expansion >
- *      recorded `trip` playback > learned `policy` (or fallback `script`).
- *   3. Scores all safe candidate directions via `scoreMove` and commits `e.d`.
+ *      danger-checked `trip` playback > learned `policy` (or fallback `script`).
+ *   3. Scores all 4 candidate directions (including 180° U-turns) via `scoreMove`
+ *      and commits `e.d`.
  */
 function ghostDecide(e){
   var d = e.d, prefs = [], target = -1, k, c, h, s;
@@ -1618,6 +1648,7 @@ function ghostDecide(e){
   e.idle = (!out && !len) ? e.idle + 1 : 0;
   if (!e.model) e.sc++;
   var reason = 'none';
+  var curMaxTrail = effectiveMaxTrail(e);
 
   if (!out){
     e.tpl = null; e.ret = false;
@@ -1625,7 +1656,7 @@ function ghostDecide(e){
     var td = minEnemyDistToTrail(e);
     var safeHome = safestOwn(e);
     var hd = safeHome >= 0 ? (Math.abs((safeHome % W) - e.x) + Math.abs(((safeHome / W) | 0) - e.y)) : 0;
-    if (len > e.maxTrail) e.ret = true;
+    if (len > curMaxTrail) e.ret = true;
     else if (len >= 2 && td <= hd + 1 && td <= 6) e.ret = true;
     else if (len >= 4 && !e.ret && headNear(e) && Math.random() < e.caut) e.ret = true;
   }
@@ -1636,26 +1667,33 @@ function ghostDecide(e){
   } else if (e.ret){
     target = safestOwn(e); reason = 'retreat';
   } else if (!out && e.idle > 10){
-    // FIX RATIONALE: Lowered idle threshold from 20 to 10 ticks so ghosts holding
-    // large territories trigger frontier expansion promptly instead of wandering inside.
     if (e.goal < 0 || owner[e.goal] === e.id) e.goal = pickGoal(e);
     target = e.goal; reason = 'goal';
   } else {
     e.goal = -1;
+    // FIX RATIONALE [RULE-08]: Before launching a new recorded trip (`!e.tpl`), check if
+    // an enemy head is already lurking within 5 tiles — smart players abort/retreat or
+    // turn back instead of blindly launching a long trip right into an ambush.
     if (e.model && out && e.trips && e.trips.length){
-      reason = 'trip';
-      if (!e.tpl){ e.tpl = pickTrip(e); e.ti = 0; e.tc = 0; }
-      e.tc++;
-      if (e.ti < e.tpl.length){
-        if (e.tc >= e.tpl[e.ti][0]){ prefs = [(d + e.tpl[e.ti][1]) % 4]; e.tc = 0; e.ti++; }
+      var enemyNearStart = !e.tpl && minEnemyDistToTrail(e) <= 5 && e.caut > 0.35;
+      if (enemyNearStart){
+        e.ret = true;
+        target = safestOwn(e);
+        reason = 'retreat';
       } else {
-        e.ret = true; target = safestOwn(e); reason = 'trip-end';
+        reason = 'trip';
+        if (!e.tpl){ e.tpl = pickTrip(e); e.ti = 0; e.tc = 0; }
+        e.tc++;
+        if (e.ti < e.tpl.length){
+          if (e.tc >= e.tpl[e.ti][0]){ prefs = [(d + e.tpl[e.ti][1]) % 4]; e.tc = 0; e.ti++; }
+        } else {
+          e.ret = true; target = safestOwn(e); reason = 'trip-end';
+        }
       }
     }
   }
 
   if (target >= 0){
-    // Instant U-turn shortcut if retreating and home territory is 1 cell directly behind
     var uturnDir = (d + 2) % 4;
     var ux = e.x + DX[uturnDir], uy = e.y + DY[uturnDir];
     if (e.ret && len > 0 && ux >= 0 && uy >= 0 && ux < W && uy < H && owner[uy * W + ux] === e.id){
@@ -1989,10 +2027,13 @@ function launchMatch(opts){
   var fetchPromise;
   if (mode === 'mine' && !currentUser){
     var localPicks = pickLocalGhosts(loadLocalRuns()).map(function(r){
+      var mt = r.t90 ? Math.max(10, Math.min(70, Math.round(r.t90 * 1.25 + 4))) : 22;
       return {
         dbId: 0, ownerName: 'Me', slotNum: r.id, badge: '👻 Local', elo: 1000,
         model: r.model || null, trips: r.trips || null, script: r.script || null,
-        maxTrail: r.t90 ? Math.max(10, Math.min(70, Math.round(r.t90 * 1.25 + 4))) : 22,
+        maxTrail: mt,
+        earlyMaxTrail: r.earlyMaxTrail != null ? r.earlyMaxTrail : Math.min(mt, 26),
+        lateMaxTrail: r.lateMaxTrail != null ? r.lateMaxTrail : mt,
         caut: r.caut != null ? r.caut : 0.4,
         aggr: r.aggr != null ? r.aggr : 0.4,
         wallPref: r.wallPref != null ? r.wallPref : 0.35,
@@ -2053,6 +2094,8 @@ function initArenaWithGhosts(cloudGhosts){
     g.trips = r.trips && r.trips.length >= 3 ? r.trips : null;
     g.script = g.model ? null : (r.script && r.script.length >= 3 ? r.script : genDefault());
     g.maxTrail = r.maxTrail || 22;
+    g.earlyMaxTrail = r.earlyMaxTrail != null ? r.earlyMaxTrail : Math.min(g.maxTrail, 26);
+    g.lateMaxTrail = r.lateMaxTrail != null ? r.lateMaxTrail : g.maxTrail;
     g.caut = r.caut != null ? r.caut : 0.4;
     g.aggr = r.aggr != null ? r.aggr : 0.4;
     g.wallPref = r.wallPref != null ? r.wallPref : 0.35;
@@ -2072,18 +2115,21 @@ function initArenaWithGhosts(cloudGhosts){
       g.model = lr.model || null;
       g.trips = lr.trips && lr.trips.length >= 3 ? lr.trips : null;
       g.script = g.model ? null : genDefault();
-      g.maxTrail = 20; g.aggr = lr.aggr || 0.4; g.caut = lr.caut || 0.4;
+      g.maxTrail = 20; g.earlyMaxTrail = lr.earlyMaxTrail || 20; g.lateMaxTrail = lr.lateMaxTrail || 24;
+      g.aggr = lr.aggr || 0.4; g.caut = lr.caut || 0.4;
       g.wallPref = lr.wallPref != null ? lr.wallPref : 0.35;
       g.stealPref = lr.stealPref != null ? lr.stealPref : 0.3;
       g.spinBias = lr.spinBias != null ? lr.spinBias : 0;
       g.defendPref = lr.defendPref != null ? lr.defendPref : 0.5;
+      g.uturnRate = lr.uturnRate != null ? lr.uturnRate : 0.03;
       ents.push(g); id++;
     }
   }
 
   while (ents.length < 5){
     g = mk(id, 'BOT-' + (id - 1), false);
-    g.script = genDefault(); g.maxTrail = 16 + rnd(12); g.aggr = 0.3 + Math.random() * 0.4;
+    g.script = genDefault(); g.maxTrail = 16 + rnd(12); g.earlyMaxTrail = g.maxTrail; g.lateMaxTrail = g.maxTrail + 6;
+    g.aggr = 0.3 + Math.random() * 0.4;
     ents.push(g); id++;
   }
 
@@ -2096,7 +2142,7 @@ function initArenaWithGhosts(cloudGhosts){
     dlog('[ENT] ' + de.name + ' pos=(' + de.x + ',' + de.y + ') d=' + de.d + ' badge=' + de.badge +
          ' model=' + (de.model ? Object.keys(de.model).length : 0) + ' trips=' + (de.trips ? de.trips.length : 0) +
          ' aggr=' + de.aggr + ' caut=' + de.caut + ' wall=' + de.wallPref + ' steal=' + de.stealPref +
-         ' spin=' + de.spinBias + ' def=' + de.defendPref + ' maxTrail=' + de.maxTrail);
+         ' spin=' + de.spinBias + ' def=' + de.defendPref + ' maxTrail=' + de.earlyMaxTrail + '/' + de.lateMaxTrail);
   }
   // [DEV-LOG END]
 
@@ -2361,11 +2407,10 @@ function endRound(reason){
   running = false;
   draw(1); updateHud();
 
-  // Compute 6-axis Style DNA ratios from accumulated single-round player telemetry
-  // FIX RATIONALE [RULE-08]: Lowered aggression threshold (`cs >= 8` instead of `20`)
-  // so single-round encounters register accurately, and incorporated `maxObservedTrail`
-  // when `tl.length === 0` so reckless players who die before closing loops still
-  // produce high-`maxTrail` reckless ghosts.
+  // Compute 6-axis Style DNA ratios + early/late trail limits from this single round
+  // FIX RATIONALE [RULE-09]: Computes `earlyMaxTrail` (<20% land) and `lateMaxTrail`
+  // (>=20% land) separately so ghosts match how the human player scales loop size
+  // across early-game buildup vs late-game map domination.
   var tl = trips.slice().sort(function(a, b){ return a - b; });
   var cs = player.chT + player.chA;
   var aggr = cs >= 8 ? Math.max(0.15, Math.min(0.92, (player.chT / cs - 0.35) / 0.45)) : Math.min(0.9, 0.25 + player.kills * 0.14);
@@ -2374,6 +2419,11 @@ function endRound(reason){
   var closedP90 = tl.length ? tl[Math.floor((tl.length - 1) * 0.9)] : 0;
   var rawTrailRef = tl.length ? Math.max(closedP90, Math.round(player.maxObservedTrail * 0.85)) : Math.max(12, player.maxObservedTrail);
   var maxTrailEst = Math.max(10, Math.min(72, Math.round(rawTrailRef * 1.2 + 4)));
+
+  var earlyRef = player.earlyObservedTrail > 0 ? player.earlyObservedTrail : Math.min(rawTrailRef, 22);
+  var lateRef = player.lateObservedTrail > 0 ? player.lateObservedTrail : rawTrailRef;
+  var earlyMaxTrailEst = Math.max(10, Math.min(60, Math.round(earlyRef * 1.15 + 3)));
+  var lateMaxTrailEst = Math.max(earlyMaxTrailEst, Math.min(72, Math.round(lateRef * 1.2 + 4)));
 
   var wallPref = player.totalTicks > 0 ? Math.round((player.wallTicks / player.totalTicks) * 100) / 100 : 0.35;
   var expTotal = player.stealSteps + player.neutralSteps;
@@ -2387,7 +2437,8 @@ function endRound(reason){
   // [DEV-LOG START]
   dlog('[END] reason=' + reason + ' tick=' + tick + ' peak=' + player.peak.toFixed(1) + '% kills=' + player.kills +
        ' ns=' + player.ns + ' dna=(aggr=' + aggr.toFixed(2) + ',caut=' + caut.toFixed(2) + ',wall=' + wallPref +
-       ',steal=' + stealPref + ',spin=' + spinBias + ',def=' + defendPref + ',maxTrail=' + maxTrailEst + ')');
+       ',steal=' + stealPref + ',spin=' + spinBias + ',def=' + defendPref + ',uturn=' + uturnRate +
+       ',maxTrail=' + earlyMaxTrailEst + '/' + lateMaxTrailEst + ')');
   // [DEV-LOG END]
 
   var prunedModel = pruneModel(player.model);
@@ -2402,6 +2453,7 @@ function endRound(reason){
       id: store.n, model: prunedModel, ns: player.ns,
       peak: Math.round(player.peak * 10) / 10, trip: tripN ? tripSum / tripN : 20,
       t90: tl.length ? tl[Math.floor((tl.length - 1) * 0.9)] : maxTrailEst, kills: player.kills,
+      earlyMaxTrail: earlyMaxTrailEst, lateMaxTrail: lateMaxTrailEst,
       aggr: Math.round(aggr * 100) / 100, caut: Math.round(caut * 100) / 100,
       wallPref: wallPref, stealPref: stealPref, spinBias: spinBias, defendPref: defendPref, uturnRate: uturnRate,
       trips: bestTrips, t: Date.now()
@@ -2484,6 +2536,8 @@ function endRound(reason){
         aggr: Math.round(aggr * 100) / 100,
         caut: Math.round(caut * 100) / 100,
         maxTrail: maxTrailEst,
+        earlyMaxTrail: earlyMaxTrailEst,
+        lateMaxTrail: lateMaxTrailEst,
         wallPref: wallPref,
         stealPref: stealPref,
         spinBias: spinBias,
