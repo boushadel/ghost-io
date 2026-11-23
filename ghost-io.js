@@ -39,6 +39,16 @@
 //               in `ghost-io.js` for zero-build `npx wrangler deploy`.
 //   - [RULE-06] Zero Backticks (`) inside `const HTML = String.raw`...`;` so the
 //               embedded frontend template literal never terminates prematurely.
+//   - [RULE-07] Single-Round Ghost Learning: Each cloned ghost must learn a
+//               player's playstyle exclusively from a SINGLE round (3 lives or
+//               victory). NEVER merge, average, or accumulate behavioral models
+//               across multiple matches.
+//   - [RULE-08] Faithful Skill & Style Mirroring: Cloned ghosts must mirror the
+//               human player's actual competence in that single round — smart
+//               players produce smart ghosts, cautious players produce cautious
+//               ghosts, and reckless/overextending players produce reckless ghosts.
+//               Fallback `BOT-N` fillers must play clean baseline loops without
+//               pathfinding bugs (no 100-tile straight-line stalls or 2x2 spins).
 //
 // [C] SYSTEM ARCHITECTURE & DATABASE SCHEMA REFERENCE
 // ----------------------------------------------------------------------------
@@ -122,7 +132,7 @@ async function getAuthUser(request, env) {
 
 /**
  * Assigns a human-readable archetype badge to a cloned ghost based on its
- * dominant behavioral traits recorded during the human player's round.
+ * dominant behavioral traits recorded during the human player's single round.
  * Evaluated in priority order from most specialized combat/expansion style
  * down to the general-purpose "Phantom" fallback.
  */
@@ -390,9 +400,9 @@ async function handleMatch(request, env) {
  *      ignoring any ghost owned by the challenger to prevent self-boosting) and
  *      inserts an unseen `battle_logs` entry for each ghost's owner.
  *   2. Updates the authenticated player's ELO rating, peak territory, and career stats.
- *   3. If the player made >= 40 decisions (`ns >= 40`), saves their newly trained
- *      behavioral model & trips to KV and registers a new ghost slot in D1 (max 5
- *      slots; automatically evicts the lowest-ELO unlocked ghost when full).
+ *   3. [RULE-07] If the player made >= 40 decisions (`ns >= 40`) in THIS single round,
+ *      saves their newly trained behavioral model & trips to KV and registers a new
+ *      ghost slot in D1 (max 5 slots; evicts lowest-ELO unlocked ghost when full).
  */
 async function handleReport(request, env) {
   let body;
@@ -494,7 +504,7 @@ async function handleReport(request, env) {
     };
   }
 
-  // Step 3: Save Player's New Ghost to D1 + KV (max 5 slots per user)
+  // Step 3: Save Player's New Single-Round Ghost to D1 + KV (max 5 slots per user)
   let ghostSaved = false;
   let ghostMsg = "";
   const badge = classifyGhostBadge(aggr, caut, maxTrail, stealPref, wallPref, defendPref);
@@ -890,11 +900,15 @@ function mk(id, name, isPlayer){
     // 6-axis Behavioral Cloning DNA traits (loaded from KV for ghosts, or default for bots):
     script: null, si: 0, sc: 0, maxTrail: 20, aggr: 0.4, caut: 0.3,
     wallPref: 0.35, stealPref: 0.3, spinBias: 0, defendPref: 0.5, uturnRate: 0.03,
-    // Real-time player telemetry accumulators (recorded only when isPlayer === true):
+    // Real-time single-round player telemetry accumulators (recorded only when isPlayer === true):
     idle: 0, goal: -1, since: 0, pend: -1, model: null, ns: 0,
     chT: 0, chA: 0, fT: 0, fA: 0,
     wallTicks: 0, totalTicks: 0, stealSteps: 0, neutralSteps: 0,
     rightTurns: 0, leftTurns: 0, uturns: 0, defT: 0, defA: 0,
+    // FIX RATIONALE [RULE-08]: Tracks the longest exposed trail the player reached during
+    // the round even if they died before closing a loop, so reckless players who die
+    // overextending still produce reckless ghosts with high `maxTrail`.
+    maxObservedTrail: 0,
     // Geometric loop ("trip") recorder & playback state:
     trips: null, tpl: null, ti: 0, tc: 0, ret: false, tripOn: false,
     tseg: [], tp0: 0, tlist: [], tHunt: false, tripWall: 0, tripSteal: 0, tripSteps: 0,
@@ -1117,13 +1131,14 @@ function recount(){
 
 // ============================================================================
 // [SECTION 6] DEEP PLAYER BEHAVIOR LEARNING (STYLE DNA + CONTEXT CLONING)
-// Purpose: Passively observes every human player tick to extract:
+// Purpose: Passively observes every human player tick within a SINGLE round
+// ([RULE-07]) to extract:
 //   1. A 5-level hierarchical context-action frequency table (`ctxKeys`) using
 //      egocentric relative coordinates so learned habits generalize to any heading.
 //   2. Geometric loop templates (`tripTrack` / `keepTrips`) scored by area gain
 //      and step efficiency.
 //   3. 6 continuous behavioral DNA traits (`aggr`, `caut`, `wallPref`, `stealPref`,
-//      `spinBias`, `defendPref`).
+//      `spinBias`, `defendPref`) that faithfully mirror the player's skill ([RULE-08]).
 // ============================================================================
 
 /**
@@ -1270,6 +1285,9 @@ function keepTrips(list){
 function track(p){
   var cellIdx = p.y * W + p.x;
   var out = owner[cellIdx] !== p.id;
+  var curTrail = p.trail.length + (p.pend >= 0 ? 1 : 0);
+  if (curTrail > p.maxObservedTrail) p.maxObservedTrail = curTrail;
+
   p.totalTicks++;
   if (Math.min(p.x, W - 1 - p.x, p.y, H - 1 - p.y) <= 4) p.wallTicks++;
   if (out){
@@ -1292,7 +1310,7 @@ function track(p){
   }
 
   // Measure Caution: when exposed with >= 4 trail segments and an enemy nearby, does player retreat home?
-  if (p.trail.length + (p.pend >= 0 ? 1 : 0) >= 4 && headNear(p)){
+  if (curTrail >= 4 && headNear(p)){
     var n = nearestOwn(p);
     if (n >= 0){
       d = Math.abs(n % W - p.x) + Math.abs(((n / W) | 0) - p.y);
@@ -1344,8 +1362,16 @@ function okCell(e, c){
 
 /**
  * Greedy Manhattan router toward cell index `t`.
- * Penalizes stepping onto `e`'s own trail (`+6`) and slightly favors straight
- * continuation (`+0.5` turn penalty) to avoid unnecessary zig-zagging.
+ * FIX RATIONALE [RULE-08]: Previously, when target `t` was directly behind `e`
+ * (`rem <= 0 && side === 0`), `side !== 0` skipped the turn check and the fallback
+ * loop penalized turns by `+0.5` while straight-away movement had `0` turn penalty,
+ * causing bots/ghosts in `retreat` mode to walk straight AWAY from home for 70-120
+ * tiles until hitting the arena wall (`BOT-2` & `BOT-3` bug in dev logs).
+ * Now:
+ *   1. When `rem <= 0 && side === 0`, immediately picks a 90-degree turn (left or
+ *      right, favoring whichever side has no own trail and more room to turn around).
+ *   2. In the fallback loop, moving straight when `rem <= 0` receives a `+2.5`
+ *      wrong-way penalty so `goTo` never walks straight away from its target.
  */
 function goTo(e, t){
   var tx = t % W, ty = (t / W) | 0, best = -1, bs = 1e9, k, c, nx, ny, sc, d = e.d, ex = tx - e.x, ey = ty - e.y;
@@ -1356,11 +1382,26 @@ function goTo(e, t){
     c = (d % 2 === 0) ? (side > 0 ? 1 : 3) : (side > 0 ? 0 : 2);
     if (okCell(e, c)) return c;
   }
+  if (rem <= 0 && side === 0){
+    var rDir = (d + 1) % 4, lDir = (d + 3) % 4;
+    var rOk = okCell(e, rDir), lOk = okCell(e, lDir);
+    if (rOk && !lOk) return rDir;
+    if (lOk && !rOk) return lDir;
+    if (rOk && lOk){
+      // Pick the side with more space toward arena center so the U-turn arc doesn't hit a wall
+      var rx = e.x + DX[rDir], ry = e.y + DY[rDir];
+      var lx = e.x + DX[lDir], ly = e.y + DY[lDir];
+      var rCenterDist = Math.abs(rx - W / 2) + Math.abs(ry - H / 2);
+      var lCenterDist = Math.abs(lx - W / 2) + Math.abs(ly - H / 2);
+      return rCenterDist <= lCenterDist ? rDir : lDir;
+    }
+  }
   for (k = 0; k < 3; k++){
     c = (e.d + (k === 0 ? 0 : k === 1 ? 1 : 3)) % 4;
     nx = e.x + DX[c]; ny = e.y + DY[c];
     if (nx < 0 || ny < 0 || nx >= W || ny >= H) continue;
-    sc = Math.abs(tx - nx) + Math.abs(ty - ny) + (trail[ny * W + nx] === e.id ? 6 : 0) + (k ? 0.5 : 0);
+    var wrongWayPen = (k === 0 && rem <= 0) ? 2.5 : (k ? 0.5 : 0);
+    sc = Math.abs(tx - nx) + Math.abs(ty - ny) + (trail[ny * W + nx] === e.id ? 6 : 0) + wrongWayPen;
     if (sc < bs){ bs = sc; best = c; }
   }
   return best;
@@ -1648,7 +1689,7 @@ function ghostDecide(e){
   if (e.d !== d) e.since = 0;
   e.since++;
 
-  // [DEV-LOG START] Log major AI mode switches and detect anomalous spinning or prolonged idle
+  // [DEV-LOG START] Log major AI mode switches and detect anomalous wandering spins or prolonged idle
   if (reason !== e.prevReason && (reason === 'hunt' || reason === 'retreat' || reason === 'goal' || reason === 'trip')){
     var tInfo = target >= 0 ? ('->(' + (target % W) + ',' + ((target / W) | 0) + ')') : '';
     dlog('[AI-MODE] ' + e.name + ' ' + e.prevReason + '->' + reason + tInfo + ' at (' + e.x + ',' + e.y + ') trail=' + len);
@@ -1658,7 +1699,7 @@ function ghostDecide(e){
   if (e.d !== d){
     e.turnHist.push(tick);
     if (e.turnHist.length > 5) e.turnHist.shift();
-    if (!out && e.turnHist.length === 5 && (tick - e.turnHist[0]) <= 10 && (tick - e.spinWarnedTick) >= 25){
+    if (!out && reason !== 'hunt' && e.turnHist.length === 5 && (tick - e.turnHist[0]) <= 10 && (tick - e.spinWarnedTick) >= 25){
       e.spinWarnedTick = tick;
       var tStr = target >= 0 ? ('(' + (target % W) + ',' + ((target / W) | 0) + ')') : 'none';
       dlog('[SPIN] ' + e.name + ' pos=(' + e.x + ',' + e.y + ') idle=' + e.idle + ' reason=' + reason +
@@ -2313,18 +2354,26 @@ function showRoster(){
 }
 
 // --- Screen 5: End of Round, Style DNA Summary & Cloud Sync ---
+// [RULE-07] & [RULE-08]: Extracts Style DNA strictly from this single round's
+// telemetry so smart/cautious/reckless players produce matching single-round ghosts.
 function endRound(reason){
   if (!running) return;
   running = false;
   draw(1); updateHud();
 
-  // Compute 6-axis Style DNA ratios from accumulated player telemetry
+  // Compute 6-axis Style DNA ratios from accumulated single-round player telemetry
+  // FIX RATIONALE [RULE-08]: Lowered aggression threshold (`cs >= 8` instead of `20`)
+  // so single-round encounters register accurately, and incorporated `maxObservedTrail`
+  // when `tl.length === 0` so reckless players who die before closing loops still
+  // produce high-`maxTrail` reckless ghosts.
   var tl = trips.slice().sort(function(a, b){ return a - b; });
   var cs = player.chT + player.chA;
-  var aggr = cs >= 20 ? Math.max(0.15, Math.min(0.92, (player.chT / cs - 0.38) / 0.42)) : Math.min(0.9, 0.3 + player.kills * 0.12);
+  var aggr = cs >= 8 ? Math.max(0.15, Math.min(0.92, (player.chT / cs - 0.35) / 0.45)) : Math.min(0.9, 0.25 + player.kills * 0.14);
   var fs = player.fT + player.fA;
-  var caut = fs >= 6 ? Math.max(0.2, Math.min(0.95, (player.fT / fs - 0.42) / 0.45)) : 0.4;
-  var maxTrailEst = tl.length ? Math.max(10, Math.min(70, Math.round(tl[Math.floor((tl.length - 1) * 0.9)] * 1.25 + 4))) : 22;
+  var caut = fs >= 5 ? Math.max(0.15, Math.min(0.95, (player.fT / fs - 0.40) / 0.45)) : (player.maxObservedTrail > 36 ? 0.25 : 0.45);
+  var closedP90 = tl.length ? tl[Math.floor((tl.length - 1) * 0.9)] : 0;
+  var rawTrailRef = tl.length ? Math.max(closedP90, Math.round(player.maxObservedTrail * 0.85)) : Math.max(12, player.maxObservedTrail);
+  var maxTrailEst = Math.max(10, Math.min(72, Math.round(rawTrailRef * 1.2 + 4)));
 
   var wallPref = player.totalTicks > 0 ? Math.round((player.wallTicks / player.totalTicks) * 100) / 100 : 0.35;
   var expTotal = player.stealSteps + player.neutralSteps;
@@ -2352,7 +2401,7 @@ function endRound(reason){
     store.runs.push({
       id: store.n, model: prunedModel, ns: player.ns,
       peak: Math.round(player.peak * 10) / 10, trip: tripN ? tripSum / tripN : 20,
-      t90: tl.length ? tl[Math.floor((tl.length - 1) * 0.9)] : 20, kills: player.kills,
+      t90: tl.length ? tl[Math.floor((tl.length - 1) * 0.9)] : maxTrailEst, kills: player.kills,
       aggr: Math.round(aggr * 100) / 100, caut: Math.round(caut * 100) / 100,
       wallPref: wallPref, stealPref: stealPref, spinBias: spinBias, defendPref: defendPref, uturnRate: uturnRate,
       trips: bestTrips, t: Date.now()
