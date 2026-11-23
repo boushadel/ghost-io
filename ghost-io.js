@@ -495,6 +495,7 @@ const HTML = String.raw`<!doctype html>
   button.alt{background:#2a315c;color:#e8ebff;font-size:12px;padding:7px 12px;min-height:34px}
   button.sm{background:#2a315c;color:#e8ebff;font-size:11px;padding:4px 8px;min-height:28px;margin:0 2px}
   button.danger{background:#4d2336;color:#ff8fa0}
+  button.dev{background:#263b36;color:#59e0a0;border:1px dashed #59e0a0;font-size:12px;padding:7px 12px;min-height:34px}
   button:disabled{opacity:.5}
   input{width:100%;box-sizing:border-box;background:#10142a;border:1px solid #323c73;color:#fff;padding:10px 12px;border-radius:10px;font-size:14px;margin:6px 0;-webkit-user-select:text;user-select:text}
   table{width:100%;border-collapse:collapse;margin:8px 0;font-size:12px}
@@ -574,6 +575,37 @@ var gameMode = 'others';    // 'others' | 'mine' | 'friend' | 'ghost'
 var friendQuery = '';       // Friend username for 'friend' mode
 var challengeGhostId = 0;   // Specific ghost DB ID for 'ghost' (Revenge) mode
 var lastMatchConfig = null; // Stores parameters for instant "Play Again"
+
+// [DEV-LOG START] Temporary diagnostic logger for development debugging
+var devLogs = [];
+function dlog(msg){
+  if (devLogs.length >= 260) devLogs.shift();
+  devLogs.push('T' + tick + ' ' + msg);
+}
+function copyDevLog(btnEl){
+  var text = '=== GHOST.IO DEV LOG ===\n' + devLogs.join('\n');
+  function done(){
+    if (btnEl){ btnEl.textContent = '✅ Copied! Paste in chat'; }
+  }
+  if (navigator.clipboard && navigator.clipboard.writeText){
+    navigator.clipboard.writeText(text).then(done).catch(fallbackCopy);
+  } else {
+    fallbackCopy();
+  }
+  function fallbackCopy(){
+    var ta = document.createElement('textarea');
+    ta.value = text;
+    ta.style.position = 'fixed';
+    ta.style.opacity = '0';
+    document.body.appendChild(ta);
+    ta.focus();
+    ta.select();
+    try { document.execCommand('copy'); } catch(e) {}
+    document.body.removeChild(ta);
+    done();
+  }
+}
+// [DEV-LOG END]
 
 // Shared utility helpers
 function rnd(n){ return Math.floor(Math.random() * n); }
@@ -691,7 +723,10 @@ function mk(id, name, isPlayer){
     rightTurns: 0, leftTurns: 0, uturns: 0, defT: 0, defA: 0,
     // Trip shape recorder & playback state:
     trips: null, tpl: null, ti: 0, tc: 0, ret: false, tripOn: false,
-    tseg: [], tp0: 0, tlist: [], tHunt: false, tripWall: 0, tripSteal: 0, tripSteps: 0
+    tseg: [], tp0: 0, tlist: [], tHunt: false, tripWall: 0, tripSteal: 0, tripSteps: 0,
+    // [DEV-LOG START] Per-entity diagnostic tracking
+    turnHist: [], lastReason: 'init', spinWarnedTick: -99
+    // [DEV-LOG END]
   };
 }
 
@@ -724,6 +759,7 @@ function spawn(e, force){
   e.x = x; e.y = y; e.px = x; e.py = y; e.alive = true; e.born = tick;
   e.trail = []; e.pend = -1; e.since = 0; e.exit = -1; e.idle = 0; e.goal = -1;
   e.tripOn = false; e.tpl = null; e.ret = false;
+  e.turnHist = [];
   var cx = W / 2, cy = H / 2;
   e.d = (Math.abs(cx - x) > Math.abs(cy - y)) ? (x < cx ? 0 : 2) : (y < cy ? 1 : 3);
   return true;
@@ -734,6 +770,10 @@ function kill(e, by){
   e.alive = false;
   for (var k = 0; k < e.trail.length; k++) trail[e.trail[k]] = 0;
   e.trail = []; e.pend = -1; e.tripOn = false; e.deaths++;
+
+  // [DEV-LOG START]
+  dlog('[KILL] ' + e.name + ' killed by ' + (by ? by.name : '0%-land') + ' at (' + e.x + ',' + e.y + ')');
+  // [DEV-LOG END]
 
   if (e.isPlayer && by && !by.isPlayer) by.killsOnPlayer = (by.killsOnPlayer || 0) + 1;
   if (!e.isPlayer && by && by.isPlayer) e.killedByPlayer = (e.killedByPlayer || 0) + 1;
@@ -769,10 +809,14 @@ function fill(id){
 }
 
 function closeLoop(e){
-  if (e.isPlayer){ tripSum += e.trail.length; tripN++; trips.push(e.trail.length); }
-  for (var k = 0; k < e.trail.length; k++){ owner[e.trail[k]] = e.id; trail[e.trail[k]] = 0; }
+  var tLen = e.trail.length;
+  if (e.isPlayer){ tripSum += tLen; tripN++; trips.push(tLen); }
+  for (var k = 0; k < tLen; k++){ owner[e.trail[k]] = e.id; trail[e.trail[k]] = 0; }
   e.trail = [];
   fill(e.id);
+  // [DEV-LOG START]
+  if (tLen >= 6) dlog('[LOOP] ' + e.name + ' closed trail=' + tLen);
+  // [DEV-LOG END]
 }
 
 function commit(){
@@ -843,7 +887,6 @@ function sector(e, dx, dy){
   return Math.abs(f) >= Math.abs(r) ? (f > 0 ? 0 : 2) : (r > 0 ? 1 : 3);
 }
 
-// Minimum Manhattan distance from any live rival head to entity e's exposed trail or head
 function minEnemyDistToTrail(e){
   var bd = 99, n, o, k, d, ti;
   for (n = 0; n < ents.length; n++){
@@ -860,7 +903,6 @@ function minEnemyDistToTrail(e){
   return bd;
 }
 
-// Encodes current tactical + spatial state into 5 hierarchical context keys
 function ctxKeys(e){
   var cellIdx = e.y * W + e.x;
   var home = owner[cellIdx] === e.id;
@@ -884,7 +926,6 @@ function ctxKeys(e){
     }
   }
 
-  // Trail exposure danger level: compares rival head distance to our tail vs our distance back home
   var td = home ? 99 : minEnemyDistToTrail(e);
   var hd = (!home && e.exit >= 0) ? (Math.abs(e.exit % W - e.x) + Math.abs(((e.exit / W) | 0) - e.y)) : 0;
   var danger = (!home && td <= hd + 1 && td <= 7) ? 2 : (!home && td <= 5) ? 1 : 0;
@@ -901,7 +942,6 @@ function ctxKeys(e){
   ];
 }
 
-// Records relative turn choice (0=straight, 1=right, 2=U-turn, 3=left) + global spin/U-turn stats
 function learn(p, act){
   var ks = ctxKeys(p), m = p.model, k, l;
   for (l = 0; l < ks.length; l++){ k = ks[l]; (m[k] || (m[k] = [0, 0, 0, 0]))[act]++; }
@@ -911,7 +951,6 @@ function learn(p, act){
   else if (act === 2) p.uturns++;
 }
 
-// Records loop geometry along with efficiency (gain/steps), wall context, and stolen land count
 function tripTrack(p, rel){
   var cellIdx = p.y * W + p.x;
   var out = owner[cellIdx] !== p.id;
@@ -936,7 +975,6 @@ function tripTrack(p, rel){
   }
 }
 
-// Retains the top 28 trips scored by (gain + efficiency bonus) plus the 12 most recent trips
 function keepTrips(list){
   var a = list.slice().sort(function(x, y){
     var sx = x.g + (x.eff || 0) * 6;
@@ -948,7 +986,6 @@ function keepTrips(list){
   return out;
 }
 
-// Measures Aggression, Caution, Wall-Hug Affinity, Land-Stealing, and Home-Territory Defense
 function track(p){
   var cellIdx = p.y * W + p.x;
   var out = owner[cellIdx] !== p.id;
@@ -959,7 +996,6 @@ function track(p){
     else p.neutralSteps++;
   }
 
-  // 1. Aggression: closing distance to nearby rival trails
   var bd = 11, tx = 0, ty = 0, i, k, o, d;
   for (i = 0; i < ents.length; i++){
     o = ents[i]; if (o === p || !o.alive) continue;
@@ -973,7 +1009,6 @@ function track(p){
     p.tHunt = true;
   }
 
-  // 2. Caution: retreating toward own land when a rival head approaches while exposed
   if (p.trail.length + (p.pend >= 0 ? 1 : 0) >= 4 && headNear(p)){
     var n = nearestOwn(p);
     if (n >= 0){
@@ -982,7 +1017,6 @@ function track(p){
     }
   }
 
-  // 3. Home Defense: chasing rivals who trespass inside p's own territory
   for (i = 0; i < ents.length; i++){
     o = ents[i];
     if (o === p || !o.alive || !o.trail.length) continue;
@@ -1019,7 +1053,6 @@ function okCell(e, c){
   return nx >= 0 && ny >= 0 && nx < W && ny < H && trail[ny * W + nx] !== e.id;
 }
 
-// Human-like L-shaped pathfinding toward target cell t
 function goTo(e, t){
   var tx = t % W, ty = (t / W) | 0, best = -1, bs = 1e9, k, c, nx, ny, sc, d = e.d, ex = tx - e.x, ey = ty - e.y;
   var rem = (d % 2 === 0) ? ex * DX[d] : ey * DY[d];
@@ -1049,7 +1082,6 @@ function nearestOwn(e){
   return best;
 }
 
-// Finds the closest own territory cell while penalizing entry points guarded by enemy heads
 function safestOwn(e){
   var best = -1, bs = 1e9, i, cx, cy, d, n, o, ed, pen;
   for (i = 0; i < N; i++){
@@ -1068,7 +1100,6 @@ function safestOwn(e){
   return best >= 0 ? best : nearestOwn(e);
 }
 
-// Selects a recorded player trip weighted by gain, efficiency, and matching wall/open context
 function pickTrip(e){
   var list = e.trips;
   var nearWall = (Math.min(e.x, W - 1 - e.x, e.y, H - 1 - e.y) <= 4) ? 1 : 0;
@@ -1086,7 +1117,6 @@ function pickTrip(e){
   return list[0].s;
 }
 
-// Smart trail interception: prioritizes intruders inside own land and checks if trail is reachable before rival closes loop
 function hunt(e){
   if (tick - e.born < 25) return -1;
   var baseRange = 4 + Math.floor(e.aggr * 7);
@@ -1111,7 +1141,6 @@ function hunt(e){
   return best;
 }
 
-// Picks an expansion target biased by the player's wall-hugging and land-stealing preferences
 function pickGoal(e){
   var best = -1, bestScore = -1e9;
   var wantWall = e.wallPref != null ? e.wallPref : 0.35;
@@ -1134,7 +1163,6 @@ function pickGoal(e){
   return best;
 }
 
-// Samples relative turn action from the 5-level learned model, falling back to player's spinBias
 function policy(e){
   var ks = ctxKeys(e), c, t, r, a;
   for (var l = 0; l < 5; l++){
@@ -1163,23 +1191,18 @@ function scoreMove(e, c, isPreferred){
   var len = e.trail.length + (e.pend >= 0 ? 1 : 0);
   var sc = isPreferred ? 50 : 0;
 
-  // Immediate home escape bonus when retreating
   if (e.ret && len > 0 && owner[idx] === e.id) sc += 35;
-
-  // Avoid stepping back over own trail unless escaping
   if (trail[idx] === e.id && !(e.ret && owner[idx] === e.id)) sc -= 14;
 
-  // Threat lookahead against rival heads
   for (var n = 0; n < ents.length; n++){
     var o = ents[n];
     if (o === e || !o.alive) continue;
     var d = Math.abs(o.x - nx) + Math.abs(o.y - ny);
-    if (d === 0 && o.pct >= e.pct) sc -= 80;       // Lethal head-on against larger/equal rival
-    else if (d === 1 && len > 0) sc -= 28;         // Dangerous exposure right next to rival head
+    if (d === 0 && o.pct >= e.pct) sc -= 80;
+    else if (d === 1 && len > 0) sc -= 28;
     else if (d === 1 && o.pct >= e.pct) sc -= 18;
   }
 
-  // Subtle personality tie-breakers matching player's DNA
   var wd = Math.min(nx, W - 1 - nx, ny, H - 1 - ny);
   if (wd <= 4) sc += ((e.wallPref != null ? e.wallPref : 0.35) - 0.35) * 8;
   if (owner[idx] > 0 && owner[idx] !== e.id) sc += ((e.stealPref != null ? e.stealPref : 0.3) - 0.3) * 8;
@@ -1197,8 +1220,8 @@ function ghostDecide(e){
   var out = owner[e.y * W + e.x] !== e.id, len = e.trail.length + (e.pend >= 0 ? 1 : 0);
   e.idle = (!out && !len) ? e.idle + 1 : 0;
   if (!e.model) e.sc++;
+  var reason = 'none';
 
-  // Dynamic survival & retreat check (includes trail-danger vs home-distance awareness)
   if (!out){
     e.tpl = null; e.ret = false;
   } else {
@@ -1212,27 +1235,27 @@ function ghostDecide(e){
 
   h = hunt(e);
   if (h >= 0){
-    target = h; e.tpl = null; e.ret = true; e.goal = -1;
+    target = h; e.tpl = null; e.ret = true; e.goal = -1; reason = 'hunt';
   } else if (e.ret){
-    target = safestOwn(e);
+    target = safestOwn(e); reason = 'retreat';
   } else if (!out && e.idle > (e.model ? 32 : 14)){
     if (e.goal < 0 || owner[e.goal] === e.id) e.goal = pickGoal(e);
-    target = e.goal;
+    target = e.goal; reason = 'goal';
   } else {
     e.goal = -1;
     if (e.model && out && e.trips && e.trips.length){
+      reason = 'trip';
       if (!e.tpl){ e.tpl = pickTrip(e); e.ti = 0; e.tc = 0; }
       e.tc++;
       if (e.ti < e.tpl.length){
         if (e.tc >= e.tpl[e.ti][0]){ prefs = [(d + e.tpl[e.ti][1]) % 4]; e.tc = 0; e.ti++; }
       } else {
-        e.ret = true; target = safestOwn(e);
+        e.ret = true; target = safestOwn(e); reason = 'trip-end';
       }
     }
   }
 
   if (target >= 0){
-    // Check if an immediate U-turn lands directly on own safe territory when retreating
     var uturnDir = (d + 2) % 4;
     var ux = e.x + DX[uturnDir], uy = e.y + DY[uturnDir];
     if (e.ret && len > 0 && ux >= 0 && uy >= 0 && ux < W && uy < H && owner[uy * W + ux] === e.id){
@@ -1243,15 +1266,16 @@ function ghostDecide(e){
     }
   } else if (!prefs.length && !(e.model && e.trips && e.trips.length)){
     if (e.model){
+      reason = 'policy';
       c = policy(e);
       if (c) prefs = [(d + c) % 4];
     } else {
+      reason = 'script';
       s = e.script[e.si % e.script.length];
       if (e.sc >= s[0]){ prefs = [(d + s[1]) % 4]; e.sc = 0; e.si++; }
     }
   }
 
-  // Evaluate all 4 directions using tactical safety + style DNA scoring
   var candidates = [d, (d + 1) % 4, (d + 3) % 4, (d + 2) % 4];
   var bestDir = d, bestVal = -1e9;
   for (k = 0; k < candidates.length; k++){
@@ -1261,8 +1285,26 @@ function ghostDecide(e){
     if (val > bestVal){ bestVal = val; bestDir = cand; }
   }
   e.d = bestDir;
+  e.lastReason = reason;
   if (e.d !== d) e.since = 0;
   e.since++;
+
+  // [DEV-LOG START] Detect spinning inside own territory
+  if (e.d !== d){
+    e.turnHist.push(tick);
+    if (e.turnHist.length > 5) e.turnHist.shift();
+    if (!out && e.turnHist.length === 5 && (tick - e.turnHist[0]) <= 10 && (tick - e.spinWarnedTick) >= 25){
+      e.spinWarnedTick = tick;
+      var tStr = target >= 0 ? ('(' + (target % W) + ',' + ((target / W) | 0) + ')') : 'none';
+      dlog('[SPIN] ' + e.name + ' pos=(' + e.x + ',' + e.y + ') idle=' + e.idle + ' reason=' + reason +
+           ' prefs=[' + prefs.join(',') + '] d=' + e.d + ' target=' + tStr + ' spinBias=' + e.spinBias +
+           ' hasModel=' + (e.model ? 1 : 0) + ' trips=' + (e.trips ? e.trips.length : 0));
+    }
+  }
+  if (!out && e.idle === 25){
+    dlog('[IDLE] ' + e.name + ' idle=25 pos=(' + e.x + ',' + e.y + ') reason=' + reason + ' goal=' + e.goal);
+  }
+  // [DEV-LOG END]
 }
 
 
@@ -1448,6 +1490,17 @@ function step(){
   recount();
   updateMini();
   if (tick % 3 === 0) updateHud();
+
+  // [DEV-LOG START] Periodic 5-second snapshot
+  if (tick % 50 === 0){
+    var snap = ents.map(function(en){
+      var isOut = en.alive && owner[en.y * W + en.x] !== en.id ? 1 : 0;
+      return en.name + ':' + (en.alive ? (en.pct.toFixed(1) + '%@(' + en.x + ',' + en.y + ')out=' + isOut + ',idle=' + en.idle + ',r=' + en.lastReason) : 'DEAD');
+    }).join(' | ');
+    dlog('[SNAP] ' + snap);
+  }
+  // [DEV-LOG END]
+
   if (!player.alive && player.deaths >= LIVES) endRound('lives');
   else if (player.alive && tick % 5 === 0 && rivalsOut() && !roomLeft()) endRound('won');
 }
@@ -1514,6 +1567,10 @@ function initArenaWithGhosts(cloudGhosts){
   owner = new Uint8Array(N); trail = new Uint8Array(N);
   ents = []; tick = 0; q = []; tripSum = 0; tripN = 0; trips = []; toast.until = 0;
 
+  // [DEV-LOG START] Reset match log
+  devLogs = [];
+  // [DEV-LOG END]
+
   var myName = currentUser ? currentUser.username : 'You';
   player = mk(1, myName, true);
   player.model = {};
@@ -1542,7 +1599,8 @@ function initArenaWithGhosts(cloudGhosts){
     id++;
   });
 
-  if (ents.length < 5){
+  // Only backfill with Local# ghosts when playing as a Guest (not logged in)
+  if (!currentUser && ents.length < 5){
     var localFallbacks = pickLocalGhosts(loadLocalRuns());
     for (var lf = 0; lf < localFallbacks.length && ents.length < 5; lf++){
       var lr = localFallbacks[lf];
@@ -1558,6 +1616,8 @@ function initArenaWithGhosts(cloudGhosts){
       ents.push(g); id++;
     }
   }
+
+  // Fill remaining slots up to 5 total entities with standard BOTs
   while (ents.length < 5){
     g = mk(id, 'BOT-' + (id - 1), false);
     g.script = genDefault(); g.maxTrail = 16 + rnd(12); g.aggr = 0.3 + Math.random() * 0.4;
@@ -1565,6 +1625,17 @@ function initArenaWithGhosts(cloudGhosts){
   }
 
   for (var i = 0; i < ents.length; i++) spawn(ents[i], true);
+
+  // [DEV-LOG START] Log initial roster & DNA configuration
+  dlog('[START] user=' + myName + ' loggedIn=' + (currentUser ? 1 : 0) + ' mode=' + (lastMatchConfig ? lastMatchConfig.mode : gameMode));
+  for (var di = 1; di < ents.length; di++){
+    var de = ents[di];
+    dlog('[ENT] ' + de.name + ' pos=(' + de.x + ',' + de.y + ') badge=' + de.badge +
+         ' model=' + (de.model ? Object.keys(de.model).length : 0) + ' trips=' + (de.trips ? de.trips.length : 0) +
+         ' aggr=' + de.aggr + ' caut=' + de.caut + ' spinBias=' + de.spinBias + ' maxTrail=' + de.maxTrail);
+  }
+  // [DEV-LOG END]
+
   recount(); updateMini(); updateHud();
   ov.style.display = 'none';
   running = true; last = 0; acc = 0;
@@ -1822,6 +1893,10 @@ function endRound(reason){
   running = false;
   draw(1); updateHud();
 
+  // [DEV-LOG START]
+  dlog('[END] reason=' + reason + ' tick=' + tick + ' playerPeak=' + player.peak.toFixed(1) + '%');
+  // [DEV-LOG END]
+
   var tl = trips.slice().sort(function(a, b){ return a - b; });
   var cs = player.chT + player.chA;
   var aggr = cs >= 20 ? Math.max(0.15, Math.min(0.92, (player.chT / cs - 0.38) / 0.42)) : Math.min(0.9, 0.3 + player.kills * 0.12);
@@ -1829,7 +1904,6 @@ function endRound(reason){
   var caut = fs >= 6 ? Math.max(0.2, Math.min(0.95, (player.fT / fs - 0.42) / 0.45)) : 0.4;
   var maxTrailEst = tl.length ? Math.max(10, Math.min(70, Math.round(tl[Math.floor((tl.length - 1) * 0.9)] * 1.25 + 4))) : 22;
 
-  // Compute extracted behavioral DNA metrics
   var wallPref = player.totalTicks > 0 ? Math.round((player.wallTicks / player.totalTicks) * 100) / 100 : 0.35;
   var expTotal = player.stealSteps + player.neutralSteps;
   var stealPref = expTotal >= 10 ? Math.round((player.stealSteps / expTotal) * 100) / 100 : 0.3;
@@ -1843,8 +1917,8 @@ function endRound(reason){
   var bestTrips = keepTrips(player.tlist);
   var won = reason === 'won';
 
-  // Always save locally as offline backup
-  if (player.ns >= 40){
+  // Save locally only when playing as Guest
+  if (!currentUser && player.ns >= 40){
     var store = loadLocalRuns();
     store.n++;
     store.runs.push({
@@ -1892,11 +1966,18 @@ function endRound(reason){
     '<table>' + rows + '</table>' +
     '<div id="syncStatus" class="muted" style="margin:6px 0">Syncing results &amp; ghost DNA...</div>' +
     '<button id="again">Play again</button>' +
-    '<button id="homeBtn" class="alt">Lobby</button>'
+    '<button id="homeBtn" class="alt">Lobby</button>' +
+    // [DEV-LOG START]
+    '<div style="margin-top:8px"><button id="copyLogEnd" class="dev">📋 Copy Dev Log (' + devLogs.length + ')</button></div>'
+    // [DEV-LOG END]
   );
 
   document.getElementById('again').onclick = function(){ launchMatch(lastMatchConfig || { mode: gameMode }); };
   document.getElementById('homeBtn').onclick = function(){ refreshSession().then(showStart); };
+  // [DEV-LOG START]
+  var copyEndBtn = document.getElementById('copyLogEnd');
+  if (copyEndBtn) copyEndBtn.onclick = function(){ copyDevLog(copyEndBtn); };
+  // [DEV-LOG END]
 
   var oppPayload = [];
   for (var j = 1; j < ents.length; j++){
@@ -1977,10 +2058,20 @@ window.addEventListener('resize', resize);
 document.addEventListener('visibilitychange', function(){
   if (!document.hidden || !running) return;
   running = false;
-  showCard('<h2>Paused</h2><button id="res">Resume</button>');
+  showCard(
+    '<h2>Paused</h2>' +
+    '<button id="res">Resume</button>' +
+    // [DEV-LOG START]
+    '<div style="margin-top:8px"><button id="copyLogPause" class="dev">📋 Copy Dev Log (' + devLogs.length + ')</button></div>'
+    // [DEV-LOG END]
+  );
   document.getElementById('res').onclick = function(){
     ov.style.display = 'none'; running = true; last = 0; acc = 0; requestAnimationFrame(frame);
   };
+  // [DEV-LOG START]
+  var copyPauseBtn = document.getElementById('copyLogPause');
+  if (copyPauseBtn) copyPauseBtn.onclick = function(){ copyDevLog(copyPauseBtn); };
+  // [DEV-LOG END]
 });
 
 // Boot sequence: restore session if token exists, then show lobby
