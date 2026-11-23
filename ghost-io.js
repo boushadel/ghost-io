@@ -620,6 +620,8 @@ async function handleManageGhost(request, env) {
 // CLIENT GAME HTML & ENGINE (MOBILE-FIRST PAPER.IO + DEEP BEHAVIORAL CLONING)
 // [RULE-06] CRITICAL INVARIANT: Do NOT place any backtick character (`)
 // anywhere inside this String.raw template literal.
+// FIX RATIONALE [RULE-06]: Stripped all backticks from inline JSDoc comments
+// inside HTML so Wrangler esbuild never terminates String.raw early.
 // ============================================================================
 const HTML = String.raw`<!doctype html>
 <html lang="en">
@@ -687,7 +689,7 @@ const HTML = String.raw`<!doctype html>
 // palettes, tick frequency, and machine-learning confidence thresholds.
 // ============================================================================
 // Cardinal direction vectors: index 0=Right (+x), 1=Down (+y), 2=Left (-x), 3=Up (-y).
-// Turning right (CW) is `(d + 1) % 4`; turning left (CCW) is `(d + 3) % 4`; U-turn is `(d + 2) % 4`.
+// Turning right (CW) is (d + 1) % 4; turning left (CCW) is (d + 3) % 4; U-turn is (d + 2) % 4.
 var DX = [1, 0, -1, 0], DY = [0, 1, 0, -1];
 
 // Distinct neon palette for up to 7 entities; pre-parsed to RGB tuples for fast ImageData minimap writes
@@ -794,7 +796,7 @@ function esc(s){
 
 // ============================================================================
 // [SECTION 3] API CLIENT, SESSION SYNC & LOCAL GHOST REPOSITORY
-// Purpose: Wraps `fetch` with automatic Bearer authentication, manages local
+// Purpose: Wraps fetch() with automatic Bearer authentication, manages local
 // offline fallback runs for guest users, and prunes low-confidence buckets
 // before uploading trained behavioral models to Cloudflare KV.
 // ============================================================================
@@ -830,7 +832,7 @@ function saveLocalRuns(r){
 }
 
 /**
- * Generates a simple procedural step-turn script for standard fallback `BOT-N`
+ * Generates a simple procedural step-turn script for standard fallback BOT-N
  * entities when fewer than 4 real player ghosts are available.
  */
 function genDefault(){
@@ -860,8 +862,8 @@ function pickLocalGhosts(store){
 
 /**
  * Compresses a player's context-action table before KV serialization by
- * discarding fine-grained buckets with fewer than `MINS` (6) observations,
- * while always preserving level-4 (`40`/`41`) global fallback buckets.
+ * discarding fine-grained buckets with fewer than MINS (6) observations,
+ * while always preserving level-4 ('40'/'41') global fallback buckets.
  */
 function pruneModel(m){
   var o = {}, k, c;
@@ -873,8 +875,8 @@ function pruneModel(m){
 }
 
 /**
- * Validates the stored Bearer token against `/api/me` and refreshes
- * `currentUser`, `myCloudGhosts`, and any unseen `offlineReport`.
+ * Validates the stored Bearer token against '/api/me' and refreshes
+ * 'currentUser', 'myCloudGhosts', and any unseen 'offlineReport'.
  */
 function refreshSession(){
   if (!authToken){
@@ -924,7 +926,7 @@ function mk(id, name, isPlayer){
     // Geometric loop ("trip") recorder & playback state:
     trips: null, tpl: null, ti: 0, tc: 0, ret: false, tripOn: false,
     tseg: [], tp0: 0, tlist: [], tHunt: false, tripWall: 0, tripSteal: 0, tripSteps: 0,
-    // FIX RATIONALE: Tracks last turn action chosen by `policy()` inside home land to prevent 2x2 self-loops
+    // FIX RATIONALE: Tracks last turn action chosen by policy() inside home land to prevent 2x2 self-loops
     lastPolicyAct: 0,
     // [DEV-LOG START] Per-entity diagnostic state trackers
     turnHist: [], lastReason: 'init', prevReason: 'init', spinWarnedTick: -99, wallStall: 0
@@ -933,9 +935,9 @@ function mk(id, name, isPlayer){
 }
 
 /**
- * Scans the arena for candidate spawn centers `(x, y)` where:
- *   1. A `(2*rad + 1)^2` square around `(x, y)` has zero owned cells and zero trails.
- *   2. Every living rival head is at least `dist` Manhattan tiles away.
+ * Scans the arena for candidate spawn centers (x, y) where:
+ *   1. A (2*rad + 1)^2 square around (x, y) has zero owned cells and zero trails.
+ *   2. Every living rival head is at least 'dist' Manhattan tiles away.
  */
 function findSpots(e, rad, dist){
   var spots = [], x, y, dx, dy, n, o, ok;
@@ -954,7 +956,7 @@ function findSpots(e, rad, dist){
 }
 
 /**
- * Spawns entity `e` with a 3x3 home territory block and orients its initial
+ * Spawns entity 'e' with a 3x3 home territory block and orients its initial
  * heading inward toward the center of the arena so it doesn't immediately hit a wall.
  */
 function spawn(e, force){
@@ -980,8 +982,8 @@ function spawn(e, force){
 }
 
 /**
- * Eliminates entity `e`, clears its exposed trail, transfers all of its owned
- * territory to killer `by` (or neutral `0` on tie/0%-land), updates ELO kill
+ * Eliminates entity 'e', clears its exposed trail, transfers all of its owned
+ * territory to killer 'by' (or neutral 0 on tie/0%-land), updates ELO kill
  * counters, and schedules respawn after 30 ticks (3 seconds).
  */
 function kill(e, by, cause){
@@ -1019,9 +1021,9 @@ function kill(e, by, cause){
 // ============================================================================
 
 /**
- * Flood-fills from all 4 outer arena borders across cells NOT owned by `id`.
- * Any unvisited cell after the traversal is completely enclosed by `id`'s
- * border and is converted to `owner[j] = id`. Returns count of newly enclosed cells.
+ * Flood-fills from all 4 outer arena borders across cells NOT owned by 'id'.
+ * Any unvisited cell after the traversal is completely enclosed by 'id's
+ * border and is converted to owner[j] = id. Returns count of newly enclosed cells.
  */
 function fill(id){
   var seen = new Uint8Array(N), st = [];
@@ -1040,7 +1042,7 @@ function fill(id){
 }
 
 /**
- * Converts an entity's completed trail into owned territory and invokes `fill()`
+ * Converts an entity's completed trail into owned territory and invokes fill()
  * to claim any interior area enclosed by the loop.
  */
 function closeLoop(e){
@@ -1058,7 +1060,7 @@ function closeLoop(e){
 }
 
 /**
- * Commits the previous tick's pending trail cell (`e.pend`) onto the `trail` grid.
+ * Commits the previous tick's pending trail cell (e.pend) onto the 'trail' grid.
  * FIX RATIONALE: Deferred by 1 tick so an entity stepping onto an unowned tile
  * occupies it with its head first; the trail segment behind it only materializes
  * once the head advances out of that cell (unless blocked by the outer arena wall).
@@ -1074,10 +1076,10 @@ function commit(){
 }
 
 /**
- * Advances entity `e` by 1 cell in direction `e.d`.
+ * Advances entity 'e' by 1 cell in direction 'e.d'.
  * Clamps at arena walls (surviving without dying, matching Paper.io rules),
  * cuts any rival trail stepped onto, closes loops upon re-entering home land,
- * or stages `e.pend` when venturing outside home land.
+ * or stages 'e.pend' when venturing outside home land.
  */
 function move(e){
   if (!e.alive) return;
@@ -1104,7 +1106,7 @@ function move(e){
 
 /**
  * Resolves head-on collisions (two heads entering the same cell OR swapping cells)
- * BEFORE `commit()` and `move()`. The entity with larger territory % wins;
+ * BEFORE commit() and move(). The entity with larger territory % wins;
  * an exact tie eliminates both entities.
  */
 function resolveHeadOn(){
@@ -1126,7 +1128,7 @@ function resolveHeadOn(){
 
 /**
  * Recalculates live territory percentages for all entities and eliminates
- * any living entity whose territory was completely swallowed (`c[e.id] === 0`).
+ * any living entity whose territory was completely swallowed (c[e.id] === 0).
  */
 function recount(){
   var c = new Array(ents.length + 1), i;
@@ -1145,17 +1147,17 @@ function recount(){
 // [SECTION 6] DEEP PLAYER BEHAVIOR LEARNING (STYLE DNA + CONTEXT CLONING)
 // Purpose: Passively observes every human player tick within a SINGLE round
 // ([RULE-07]) to extract:
-//   1. A 5-level hierarchical context-action frequency table (`ctxKeys`) using
+//   1. A 5-level hierarchical context-action frequency table (ctxKeys) using
 //      egocentric relative coordinates so learned habits generalize to any heading.
-//   2. Geometric loop templates (`tripTrack` / `keepTrips`) scored by area gain
+//   2. Geometric loop templates (tripTrack / keepTrips) scored by area gain
 //      and step efficiency.
-//   3. 6 continuous behavioral DNA traits (`aggr`, `caut`, `wallPref`, `stealPref`,
-//      `spinBias`, `defendPref`) plus phase-scaled loop limits ([RULE-08]/[RULE-09]).
+//   3. 6 continuous behavioral DNA traits (aggr, caut, wallPref, stealPref,
+//      spinBias, defendPref) plus phase-scaled loop limits ([RULE-08]/[RULE-09]).
 // ============================================================================
 
 /**
- * Projects world-space vector `(dx, dy)` into entity `e`'s egocentric frame:
- * returns `0` (ahead), `1` (right), `2` (behind), or `3` (left).
+ * Projects world-space vector (dx, dy) into entity 'e's egocentric frame:
+ * returns 0 (ahead), 1 (right), 2 (behind), or 3 (left).
  */
 function sector(e, dx, dy){
   var f = dx * DX[e.d] + dy * DY[e.d], r = dx * DX[(e.d + 1) % 4] + dy * DY[(e.d + 1) % 4];
@@ -1164,7 +1166,7 @@ function sector(e, dx, dy){
 
 /**
  * Computes minimum Manhattan distance from any living enemy head to either
- * entity `e`'s head or any cell of `e`'s exposed trail.
+ * entity 'e's head or any cell of 'e's exposed trail.
  */
 function minEnemyDistToTrail(e){
   var bd = 99, n, o, k, d, ti;
@@ -1185,8 +1187,8 @@ function minEnemyDistToTrail(e){
 /**
  * Builds a 5-level hierarchical array of context keys (from ultra-specific level 0
  * down to coarse level 4) representing the entity's immediate tactical state.
- * FIX RATIONALE [RULE-09]: Uses `nearestOwn(e)` instead of `e.exit` for the home
- * return sector `hs` and home distance `hd`, and encodes territory phase (`pctPhase`)
+ * FIX RATIONALE [RULE-09]: Uses nearestOwn(e) instead of e.exit for the home
+ * return sector 'hs' and home distance 'hd', and encodes territory phase (pctPhase)
  * so the ghost accurately mirrors how the player closes loops toward the nearest
  * border and scales aggression/loop size from early game to late game.
  */
@@ -1232,8 +1234,8 @@ function ctxKeys(e){
 }
 
 /**
- * Increments action counts `[straight, right, uturn, left]` across all 5 context
- * specificity levels for the player's current decision `act`.
+ * Increments action counts [straight, right, uturn, left] across all 5 context
+ * specificity levels for the player's current decision 'act'.
  */
 function learn(p, act){
   var ks = ctxKeys(p), m = p.model, k, l;
@@ -1246,7 +1248,7 @@ function learn(p, act){
 
 /**
  * Records complete non-combat expansion excursions outside home territory as
- * relative `[stepCount, relativeTurn]` sequences so cloned ghosts can replay
+ * relative [stepCount, relativeTurn] sequences so cloned ghosts can replay
  * the player's signature geometric loop shapes.
  */
 function tripTrack(p, rel){
@@ -1274,7 +1276,7 @@ function tripTrack(p, rel){
 }
 
 /**
- * Retains up to 40 best trips: top 28 ranked by composite score `gain + eff * 6`
+ * Retains up to 40 best trips: top 28 ranked by composite score (gain + eff * 6)
  * plus up to 12 most recent trips to preserve late-round style adaptations.
  */
 function keepTrips(list){
@@ -1290,9 +1292,9 @@ function keepTrips(list){
 
 /**
  * Accumulates continuous behavioral telemetry on every tick to estimate the
- * player's high-level traits: Aggression (`chT/chA`), Caution (`fT/fA`),
- * Wall Preference, Steal Preference, Home Defense (`defT/defA`), and phase-scaled
- * trail lengths (`earlyObservedTrail` vs `lateObservedTrail`).
+ * player's high-level traits: Aggression (chT/chA), Caution (fT/fA),
+ * Wall Preference, Steal Preference, Home Defense (defT/defA), and phase-scaled
+ * trail lengths (earlyObservedTrail vs lateObservedTrail).
  */
 function track(p){
   var cellIdx = p.y * W + p.x;
@@ -1360,11 +1362,11 @@ function headNear(e){
 // ============================================================================
 // [SECTION 7] TACTICAL GHOST AI & STYLE-MATCHED PATHFINDING
 // Purpose: Drives autonomous AI ghosts using a layered decision architecture:
-//   1. Tactical Overrides: Trail interception (`hunt`), threat-aware retreat
-//      (`safestOwn`), and frontier-seeking expansion (`pickGoal`).
-//   2. Style Cloning: Context-matched loop playback (`pickTrip`) and 5-level
-//      hierarchical policy sampling (`policy`).
-//   3. Lookahead Safety Scorer (`scoreMove`): Supports 180-degree U-turns,
+//   1. Tactical Overrides: Trail interception (hunt), threat-aware retreat
+//      (safestOwn), and frontier-seeking expansion (pickGoal).
+//   2. Style Cloning: Context-matched loop playback (pickTrip) and 5-level
+//      hierarchical policy sampling (policy).
+//   3. Lookahead Safety Scorer (scoreMove): Supports 180-degree U-turns,
 //      prevents border stalls, head-on losses, and 2x2 spinning loops.
 // ============================================================================
 function safe(e, c){
@@ -1378,15 +1380,15 @@ function okCell(e, c){
 }
 
 /**
- * Greedy Manhattan router toward cell index `t` with full 180-degree U-turn support.
- * FIX RATIONALE [RULE-09]: Previously `goTo` only considered `[d, (d+1)%4, (d+3)%4]`
- * and excluded `(d+2)%4` (180-degree U-turn), causing `Boo#2` on the top wall (`y=0`)
- * with its trail at `y=1` to walk 122 tiles around the perimeter instead of U-turning
+ * Greedy Manhattan router toward cell index 't' with full 180-degree U-turn support.
+ * FIX RATIONALE [RULE-09]: Previously goTo() only considered [d, (d+1)%4, (d+3)%4]
+ * and excluded (d+2)%4 (180-degree U-turn), causing Boo#2 on the top wall (y=0)
+ * with its trail at y=1 to walk 122 tiles around the perimeter instead of U-turning
  * 180 degrees back to its territory. Now:
- *   1. When target `t` is directly behind (`rem <= 0 && side === 0`), allows immediate
- *      180-degree U-turn `(d + 2) % 4` (since stepping on own trail is safe in Ghost.io).
- *   2. Evaluates all 4 directions (`0, 1, 2, 3`) with only a tiny own-trail preference
- *      when NOT retreating (`!e.ret`), so retreating ghosts freely double back 180°
+ *   1. When target 't' is directly behind (rem <= 0 && side === 0), allows immediate
+ *      180-degree U-turn (d + 2) % 4 (since stepping on own trail is safe in Ghost.io).
+ *   2. Evaluates all 4 directions (0, 1, 2, 3) with only a tiny own-trail preference
+ *      when NOT retreating (!e.ret), so retreating ghosts freely double back 180°
  *      along their trail to reach safety.
  */
 function goTo(e, t){
@@ -1426,8 +1428,8 @@ function nearestOwn(e){
 
 /**
  * Finds the safest home territory cell to retreat to by penalizing both:
- *   1. Home cells within 4 tiles of a rival head (`(5 - ed) * 4`), AND
- *   2. Retreat paths whose midpoint passes within 3 tiles of a rival head (`+14`),
+ *   1. Home cells within 4 tiles of a rival head ((5 - ed) * 4), AND
+ *   2. Retreat paths whose midpoint passes within 3 tiles of a rival head (+14),
  *      preventing retreating ghosts from running across an enemy's strike path.
  */
 function safestOwn(e){
@@ -1452,8 +1454,8 @@ function safestOwn(e){
 }
 
 /**
- * Weighted roulette selection of a recorded player loop template (`e.trips`),
- * boosting trips that match the ghost's current wall-proximity context (`nearWall`).
+ * Weighted roulette selection of a recorded player loop template (e.trips),
+ * boosting trips that match the ghost's current wall-proximity context (nearWall).
  */
 function pickTrip(e){
   var list = e.trips;
@@ -1473,10 +1475,10 @@ function pickTrip(e){
 }
 
 /**
- * Scans for exposed rival trails within `e`'s aggression range.
- * Only pursues a trail if `e` can reach the target segment (`d <= rivalHomeDist + 2`)
+ * Scans for exposed rival trails within 'e's aggression range.
+ * Only pursues a trail if 'e' can reach the target segment (d <= rivalHomeDist + 2)
  * before the rival closes its loop, and expands interception range when the
- * rival is trespassing inside `e`'s own territory (scaled by `e.defendPref`).
+ * rival is trespassing inside 'e's own territory (scaled by e.defendPref).
  */
 function hunt(e){
   if (tick - e.born < 25) return -1;
@@ -1506,9 +1508,9 @@ function hunt(e){
  * Frontier-aware expansion goal selector.
  * FIX RATIONALE: Previously sampled random unowned cells across the entire map,
  * causing ghosts that grew to 15-60% territory to spend 25-32 ticks walking inside
- * their own land toward distant pockets. Awarding `+20` to unowned cells directly
- * adjacent (`adjOwn`) to `e`'s existing border ensures ghosts step out immediately
- * along their frontier while still respecting `wallPref` and `stealPref`.
+ * their own land toward distant pockets. Awarding +20 to unowned cells directly
+ * adjacent (adjOwn) to 'e's existing border ensures ghosts step out immediately
+ * along their frontier while still respecting wallPref and stealPref.
  */
 function pickGoal(e){
   var best = -1, bestScore = -1e9;
@@ -1538,9 +1540,9 @@ function pickGoal(e){
 }
 
 /**
- * Samples a relative turn action (`0=straight, 1=right, 2=uturn, 3=left`) from the
- * most specific context bucket in `e.model` that has at least `MINS` (6) samples.
- * FIX RATIONALE [RULE-09]: Uses the player's recorded `e.uturnRate` in fallback
+ * Samples a relative turn action (0=straight, 1=right, 2=uturn, 3=left) from the
+ * most specific context bucket in e.model that has at least MINS (6) samples.
+ * FIX RATIONALE [RULE-09]: Uses the player's recorded e.uturnRate in fallback
  * sampling so ghosts naturally perform 180-degree cutbacks at the player's own rate,
  * while blocking repeated identical 90-degree turns inside home land to prevent 2x2 spins.
  */
@@ -1580,11 +1582,11 @@ function policy(e){
 }
 
 /**
- * Evaluates candidate direction `c` for tactical safety and Style DNA alignment.
- * FIX RATIONALE [RULE-09]: Removed the `-32` own-trail penalty that previously blocked
+ * Evaluates candidate direction 'c' for tactical safety and Style DNA alignment.
+ * FIX RATIONALE [RULE-09]: Removed the -32 own-trail penalty that previously blocked
  * 180-degree U-turns onto an entity's own trail (stepping on own trail is completely
- * safe in Ghost.io physics). Applies only a tiny `-1.5` spread bias when expanding
- * (`!e.ret`), and `0` penalty when retreating (`e.ret`) or following a preferred U-turn.
+ * safe in Ghost.io physics). Applies only a tiny -1.5 spread bias when expanding
+ * (!e.ret), and 0 penalty when retreating (e.ret) or following a preferred U-turn.
  */
 function scoreMove(e, c, isPreferred){
   var nx = e.x + DX[c], ny = e.y + DY[c];
@@ -1621,7 +1623,7 @@ function scoreMove(e, c, isPreferred){
 
 /**
  * Computes the ghost's current effective trail limit by interpolating between
- * `earlyMaxTrail` (when `pct < 15%`) and `lateMaxTrail` (when `pct >= 35%`),
+ * earlyMaxTrail (when pct < 15%) and lateMaxTrail (when pct >= 35%),
  * mirroring how human players play tightly early on and take huge sweeps when dominant.
  */
 function effectiveMaxTrail(e){
@@ -1635,12 +1637,12 @@ function effectiveMaxTrail(e){
 
 /**
  * Master per-tick decision pipeline for every AI ghost:
- *   1. Evaluates dynamic loop safety (`effectiveMaxTrail`, trail interception danger,
- *      nearby heads) to decide whether to switch into retreat mode (`e.ret = true`).
- *   2. Priority hierarchy: `hunt` > `retreat` > `idle > 10` frontier expansion >
- *      danger-checked `trip` playback > learned `policy` (or fallback `script`).
- *   3. Scores all 4 candidate directions (including 180° U-turns) via `scoreMove`
- *      and commits `e.d`.
+ *   1. Evaluates dynamic loop safety (effectiveMaxTrail, trail interception danger,
+ *      nearby heads) to decide whether to switch into retreat mode (e.ret = true).
+ *   2. Priority hierarchy: hunt > retreat > idle > 10 frontier expansion >
+ *      danger-checked trip playback > learned policy (or fallback script).
+ *   3. Scores all 4 candidate directions (including 180° U-turns) via scoreMove()
+ *      and commits e.d.
  */
 function ghostDecide(e){
   var d = e.d, prefs = [], target = -1, k, c, h, s;
@@ -1671,7 +1673,7 @@ function ghostDecide(e){
     target = e.goal; reason = 'goal';
   } else {
     e.goal = -1;
-    // FIX RATIONALE [RULE-08]: Before launching a new recorded trip (`!e.tpl`), check if
+    // FIX RATIONALE [RULE-08]: Before launching a new recorded trip (!e.tpl), check if
     // an enemy head is already lurking within 5 tiles — smart players abort/retreat or
     // turn back instead of blindly launching a long trip right into an ambush.
     if (e.model && out && e.trips && e.trips.length){
@@ -1759,7 +1761,7 @@ function ghostDecide(e){
 // ============================================================================
 
 /**
- * Updates the 80x80 offscreen minimap ImageData pixel-by-pixel from `owner[]`.
+ * Updates the 80x80 offscreen minimap ImageData pixel-by-pixel from owner[].
  */
 function updateMini(){
   var d = mimg.data, i, o;
@@ -1774,8 +1776,8 @@ function updateMini(){
 }
 
 /**
- * Main render pass. Parameter `a` in `[0, 1]` is the fractional sub-tick
- * interpolation progress between `(px, py)` and `(x, y)` for silky motion.
+ * Main render pass. Parameter 'a' in [0, 1] is the fractional sub-tick
+ * interpolation progress between (px, py) and (x, y) for silky motion.
  */
 function draw(a){
   if (!ents.length || !cw) return;
@@ -1884,13 +1886,13 @@ function resize(){
 
 // ============================================================================
 // [SECTION 9] UI SCREENS, TOUCH INPUTS & FIXED-TIMESTEP SIMULATION LOOP
-// Purpose: Manages player turn buffering, the 10Hz `step()` orchestrator,
-// matchmaking launch (`launchMatch` / `initArenaWithGhosts`), and all 5 modal
+// Purpose: Manages player turn buffering, the 10Hz step() orchestrator,
+// matchmaking launch (launchMatch / initArenaWithGhosts), and all 5 modal
 // screens (Lobby, Auth, Leaderboards, Ghost Roster, and End-of-Round Summary).
 // ============================================================================
 
 /**
- * Enqueues a cardinal turn direction `nd` into the 2-slot input buffer `q`.
+ * Enqueues a cardinal turn direction 'nd' into the 2-slot input buffer 'q'.
  * Deduplicates consecutive identical directions so a single swipe never wastes
  * both buffer slots.
  */
@@ -1909,7 +1911,7 @@ function turn(nd){
 
 /**
  * Pops the next buffered player turn, records the action in the behavioral
- * cloning model (`learn` + `tripTrack` + `track`) BEFORE updating `p.d` so the
+ * cloning model (learn + tripTrack + track) BEFORE updating p.d so the
  * context keys reflect the exact state in which the player made the decision.
  */
 function playerDecide(p){
@@ -1946,9 +1948,9 @@ function roomLeft(){
 /**
  * Advances the simulation by 1 deterministic logic tick (100ms):
  *   1. Handles respawns for dead entities whose 30-tick timer expired.
- *   2. Collects movement decisions (`playerDecide` / `ghostDecide`) for all living entities.
+ *   2. Collects movement decisions (playerDecide / ghostDecide) for all living entities.
  *   3. Resolves head-on collisions, commits pending trails, moves heads, and updates territory %.
- *   4. Checks round termination conditions (`lives`, `noroom`, or `won`).
+ *   4. Checks round termination conditions (lives, noroom, or won).
  */
 function step(){
   tick++;
@@ -1995,7 +1997,7 @@ function step(){
 }
 
 /**
- * `requestAnimationFrame` driver with fixed-timestep accumulator (`acc >= TICK_MS`)
+ * requestAnimationFrame driver with fixed-timestep accumulator (acc >= TICK_MS)
  * and a 500ms frame-delta clamp to prevent spiral-of-death catchup after tab switches.
  */
 function frame(t){
@@ -2011,8 +2013,8 @@ function frame(t){
 function showCard(html){ card.innerHTML = html; ov.style.display = 'flex'; }
 
 /**
- * Fetches hydrated opponent ghosts from `/api/match` (or local storage if guest
- * in `mine` mode) and transitions into `initArenaWithGhosts`.
+ * Fetches hydrated opponent ghosts from '/api/match' (or local storage if guest
+ * in 'mine' mode) and transitions into initArenaWithGhosts.
  */
 function launchMatch(opts){
   opts = opts || {};
@@ -2064,10 +2066,10 @@ function launchMatch(opts){
 }
 
 /**
- * Resets grid buffers and populates the arena with the human player (`ents[0]`)
+ * Resets grid buffers and populates the arena with the human player (ents[0])
  * plus up to 4 hydrated cloud ghosts.
- * FIX RATIONALE [RULE-04]: `Local#` localStorage backfill is strictly gated behind
- * `if (!currentUser)` so authenticated accounts never face stale local browser ghosts.
+ * FIX RATIONALE [RULE-04]: Local# localStorage backfill is strictly gated behind
+ * 'if (!currentUser)' so authenticated accounts never face stale local browser ghosts.
  */
 function initArenaWithGhosts(cloudGhosts){
   owner = new Uint8Array(N); trail = new Uint8Array(N);
@@ -2408,7 +2410,7 @@ function endRound(reason){
   draw(1); updateHud();
 
   // Compute 6-axis Style DNA ratios + early/late trail limits from this single round
-  // FIX RATIONALE [RULE-09]: Computes `earlyMaxTrail` (<20% land) and `lateMaxTrail`
+  // FIX RATIONALE [RULE-09]: Computes earlyMaxTrail (<20% land) and lateMaxTrail
   // (>=20% land) separately so ghosts match how the human player scales loop size
   // across early-game buildup vs late-game map domination.
   var tl = trips.slice().sort(function(a, b){ return a - b; });
@@ -2520,7 +2522,7 @@ function endRound(reason){
     }
   }
 
-  // Practice matches against one's own ghosts (`mode === 'mine'`) do not affect ELO
+  // Practice matches against one's own ghosts (mode === 'mine') do not affect ELO
   var isRanked = !lastMatchConfig || lastMatchConfig.mode !== 'mine';
 
   apiFetch('/api/report', {
