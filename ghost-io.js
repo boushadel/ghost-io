@@ -1,12 +1,449 @@
 // ============================================================================
-// Ghost.io — Cloudflare Worker Entry & Game Container
-// A Paper.io-style arena game where opponents are "ghosts" cloned from your
-// own previous runs via behavioral cloning.
-// Architecture: No server API or database; the Worker serves the static HTML,
-// the game runs 100% client-side, and run data persists in localStorage.
+// Ghost.io — Full-Stack Cloudflare Worker (D1 + KV + Behavioral Cloning Game)
+// Architecture:
+//   - Backend: Cloudflare Worker handling Auth, ELO Matchmaking, Ghost Roster,
+//     Leaderboards, and Offline Battle Reports using D1 (SQL) + KV (JSON brains).
+//   - Frontend: Single-file mobile-first canvas game with 9 modular sections.
 // Deploy command: npx wrangler deploy
 // ============================================================================
 
+// ============================================================================
+// [WORKER SECTION 1] CRYPTO, AUTH & VALIDATION HELPERS
+// Purpose: Password hashing (Web Crypto SHA-256 + salt), secure session tokens,
+// DNA badge classification, and JSON HTTP response helpers.
+// ============================================================================
+function jsonRes(data, status = 200) {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: {
+      "content-type": "application/json;charset=UTF-8",
+      "cache-control": "no-store",
+    },
+  });
+}
+
+function randomHex(bytes = 16) {
+  const arr = new Uint8Array(bytes);
+  crypto.getRandomValues(arr);
+  return Array.from(arr, (b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+async function hashPassword(password, salt) {
+  const enc = new TextEncoder().encode(salt + ":" + password);
+  const buf = await crypto.subtle.digest("SHA-256", enc);
+  return Array.from(new Uint8Array(buf), (b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+async function getAuthUser(request, env) {
+  const auth = request.headers.get("Authorization") || "";
+  const token = auth.startsWith("Bearer ") ? auth.slice(7).trim() : "";
+  if (!token || token.length < 16) return null;
+  return await env.DB.prepare(
+    "SELECT id, username, peak, kills, wins, games, elo FROM users WHERE token = ?"
+  ).bind(token).first();
+}
+
+function classifyGhostBadge(aggr, caut, maxTrail) {
+  if (aggr >= 0.68) return "🗡️ Hunter";
+  if (caut >= 0.68 && maxTrail <= 26) return "🛡️ Defender";
+  if (maxTrail >= 42) return "👑 Greedy";
+  return "👻 Phantom";
+}
+
+function clampNum(v, min, max, fallback) {
+  const n = Number(v);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.max(min, Math.min(max, n));
+}
+
+// ============================================================================
+// [WORKER SECTION 2] D1 & KV API ENDPOINT HANDLERS
+// Purpose: Implements /api/auth, /api/me, /api/leaderboards, /api/match,
+// /api/report (ELO + ghost saving), and /api/ghosts/manage.
+// ============================================================================
+async function handleAuth(request, env) {
+  let body;
+  try { body = await request.json(); } catch { return jsonRes({ ok: false, error: "Invalid JSON" }, 400); }
+
+  const mode = body.mode === "register" ? "register" : "login";
+  const username = String(body.username || "").trim();
+  const password = String(body.password || "");
+
+  if (!/^[a-zA-Z0-9_]{3,14}$/.test(username)) {
+    return jsonRes({ ok: false, error: "Username must be 3-14 chars (letters, numbers, _)" }, 400);
+  }
+  if (password.length < 4 || password.length > 64) {
+    return jsonRes({ ok: false, error: "Password must be at least 4 characters" }, 400);
+  }
+
+  const lower = username.toLowerCase();
+  const existing = await env.DB.prepare(
+    "SELECT id, username, pass_hash, salt, peak, kills, wins, games, elo FROM users WHERE username_lower = ?"
+  ).bind(lower).first();
+
+  if (mode === "register") {
+    if (existing) return jsonRes({ ok: false, error: "Username already taken" }, 409);
+    const salt = randomHex(12);
+    const passHash = await hashPassword(password, salt);
+    const token = randomHex(24);
+    const now = Date.now();
+
+    const res = await env.DB.prepare(
+      "INSERT INTO users (username, username_lower, pass_hash, salt, token, created_at) VALUES (?, ?, ?, ?, ?, ?)"
+    ).bind(username, lower, passHash, salt, token, now).run();
+
+    const userId = res.meta?.last_row_id;
+    return jsonRes({
+      ok: true,
+      token,
+      user: { id: userId, username, peak: 0, kills: 0, wins: 0, games: 0, elo: 1000 },
+    });
+  } else {
+    if (!existing) return jsonRes({ ok: false, error: "Account not found" }, 404);
+    const checkHash = await hashPassword(password, existing.salt);
+    if (checkHash !== existing.pass_hash) {
+      return jsonRes({ ok: false, error: "Incorrect password" }, 401);
+    }
+    const token = randomHex(24);
+    await env.DB.prepare("UPDATE users SET token = ? WHERE id = ?").bind(token, existing.id).run();
+    return jsonRes({
+      ok: true,
+      token,
+      user: {
+        id: existing.id,
+        username: existing.username,
+        peak: existing.peak,
+        kills: existing.kills,
+        wins: existing.wins,
+        games: existing.games,
+        elo: existing.elo,
+      },
+    });
+  }
+}
+
+async function handleMe(request, env) {
+  const user = await getAuthUser(request, env);
+  if (!user) return jsonRes({ ok: false, error: "Unauthorized" }, 401);
+
+  const ghostsRes = await env.DB.prepare(
+    "SELECT id, slot_num, badge, peak, aggr, caut, max_trail, elo, kills, matches, wins, locked, created_at FROM ghosts WHERE user_id = ? ORDER BY locked DESC, elo DESC, id DESC"
+  ).bind(user.id).all();
+
+  const logsRes = await env.DB.prepare(
+    "SELECT id, ghost_label, challenger_name, ghost_kills, ghost_won, elo_delta, created_at FROM battle_logs WHERE owner_user_id = ? AND seen = 0 ORDER BY id DESC LIMIT 20"
+  ).bind(user.id).all();
+
+  const unseen = logsRes.results || [];
+  if (unseen.length > 0) {
+    await env.DB.prepare("UPDATE battle_logs SET seen = 1 WHERE owner_user_id = ? AND seen = 0").bind(user.id).run();
+  }
+
+  let report = null;
+  if (unseen.length > 0) {
+    let totalKills = 0, netElo = 0, wins = 0;
+    for (const l of unseen) {
+      totalKills += l.ghost_kills || 0;
+      netElo += l.elo_delta || 0;
+      if (l.ghost_won) wins++;
+    }
+    report = {
+      battles: unseen.length,
+      kills: totalKills,
+      wins,
+      netElo,
+      logs: unseen.slice(0, 6),
+    };
+  }
+
+  return jsonRes({
+    ok: true,
+    user,
+    ghosts: ghostsRes.results || [],
+    report,
+  });
+}
+
+async function handleLeaderboards(env) {
+  const playersRes = await env.DB.prepare(
+    "SELECT username, elo, peak, kills, wins, games FROM users ORDER BY elo DESC, peak DESC LIMIT 15"
+  ).all();
+
+  const ghostsRes = await env.DB.prepare(
+    "SELECT id, user_id, owner_name, slot_num, badge, elo, kills, matches, wins, peak FROM ghosts ORDER BY elo DESC, kills DESC LIMIT 15"
+  ).all();
+
+  return jsonRes({
+    ok: true,
+    players: playersRes.results || [],
+    ghosts: ghostsRes.results || [],
+  });
+}
+
+async function handleMatch(request, env) {
+  let body = {};
+  try { body = await request.json(); } catch {}
+
+  const user = await getAuthUser(request, env);
+  const mode = body.mode || "others"; // 'others' | 'mine' | 'friend' | 'ghost'
+  let rows = [];
+
+  if (mode === "mine") {
+    if (!user) return jsonRes({ ok: true, ghosts: [] });
+    const res = await env.DB.prepare(
+      "SELECT * FROM ghosts WHERE user_id = ? ORDER BY elo DESC, id DESC LIMIT 4"
+    ).bind(user.id).all();
+    rows = res.results || [];
+  } else if (mode === "friend") {
+    const target = String(body.targetName || "").trim().toLowerCase();
+    if (!target) return jsonRes({ ok: false, error: "Enter a player name" }, 400);
+    const friend = await env.DB.prepare(
+      "SELECT id, username FROM users WHERE username_lower = ?"
+    ).bind(target).first();
+    if (!friend) return jsonRes({ ok: false, error: "Player not found" }, 404);
+    const res = await env.DB.prepare(
+      "SELECT * FROM ghosts WHERE user_id = ? ORDER BY elo DESC, id DESC LIMIT 4"
+    ).bind(friend.id).all();
+    rows = res.results || [];
+    if (!rows.length) {
+      return jsonRes({ ok: false, error: friend.username + " has no saved ghosts yet" }, 404);
+    }
+  } else if (mode === "ghost") {
+    const ghostId = Number(body.ghostId || 0);
+    const primary = await env.DB.prepare("SELECT * FROM ghosts WHERE id = ?").bind(ghostId).first();
+    if (!primary) return jsonRes({ ok: false, error: "Ghost not found" }, 404);
+    rows.push(primary);
+    const teammates = await env.DB.prepare(
+      "SELECT * FROM ghosts WHERE user_id = ? AND id != ? ORDER BY elo DESC LIMIT 3"
+    ).bind(primary.user_id, primary.id).all();
+    rows = rows.concat(teammates.results || []);
+    if (rows.length < 4) {
+      const fillers = await env.DB.prepare(
+        "SELECT * FROM ghosts WHERE id != ? AND user_id != ? ORDER BY RANDOM() LIMIT ?"
+      ).bind(primary.id, primary.user_id, 4 - rows.length).all();
+      rows = rows.concat(fillers.results || []);
+    }
+  } else {
+    // Default: 'others' — pull up to 4 random/diverse ghosts belonging to other players
+    const excludeId = user ? user.id : -1;
+    const res = await env.DB.prepare(
+      "SELECT * FROM ghosts WHERE user_id != ? ORDER BY RANDOM() LIMIT 4"
+    ).bind(excludeId).all();
+    rows = res.results || [];
+  }
+
+  // Hydrate each ghost's neural/behavioral brain JSON from KV in parallel
+  const hydrated = await Promise.all(
+    rows.map(async (r) => {
+      let brain = null;
+      try {
+        brain = await env.KV.get(r.kv_key, "json");
+      } catch {}
+      return {
+        dbId: r.id,
+        ownerId: r.user_id,
+        ownerName: r.owner_name,
+        slotNum: r.slot_num,
+        badge: r.badge,
+        elo: r.elo,
+        peak: r.peak,
+        aggr: r.aggr,
+        caut: r.caut,
+        maxTrail: r.max_trail,
+        model: brain?.model || null,
+        trips: brain?.trips || null,
+      };
+    })
+  );
+
+  return jsonRes({ ok: true, ghosts: hydrated });
+}
+
+async function handleReport(request, env) {
+  let body;
+  try { body = await request.json(); } catch { return jsonRes({ ok: false, error: "Invalid JSON" }, 400); }
+
+  const user = await getAuthUser(request, env);
+  const round = body.round || {};
+  const opponents = Array.isArray(body.opponents) ? body.opponents : [];
+  const ranked = Boolean(body.ranked); // True when playing vs Others, Friend, or Revenge
+
+  const peak = clampNum(round.peak, 0, 100, 0);
+  const kills = Math.round(clampNum(round.kills, 0, 50, 0));
+  const ns = Math.round(clampNum(round.ns, 0, 100000, 0));
+  const won = Boolean(round.won);
+  const aggr = Math.round(clampNum(round.aggr, 0.1, 0.95, 0.4) * 100) / 100;
+  const caut = Math.round(clampNum(round.caut, 0.1, 0.95, 0.4) * 100) / 100;
+  const maxTrail = Math.round(clampNum(round.maxTrail, 10, 80, 20));
+
+  const challengerName = user ? user.username : "Guest";
+  const challengerElo = user ? user.elo : 1000;
+  const challengerId = user ? user.id : -1;
+
+  // 1. Update ELO ratings & offline battle logs for rival D1 ghosts
+  let oppEloSum = 0, oppCount = 0;
+  const eloUpdates = [];
+
+  if (ranked) {
+    for (const opp of opponents) {
+      const dbId = Number(opp.dbId || 0);
+      if (!dbId) continue;
+      const gRow = await env.DB.prepare(
+        "SELECT id, user_id, owner_name, slot_num, elo FROM ghosts WHERE id = ?"
+      ).bind(dbId).first();
+      if (!gRow || gRow.user_id === challengerId) continue;
+
+      oppEloSum += gRow.elo;
+      oppCount++;
+
+      const killsByGhost = Math.round(clampNum(opp.killsOnPlayer, 0, 10, 0));
+      const killedByPlayer = Math.round(clampNum(opp.killedByPlayer, 0, 10, 0));
+      const oppPeak = clampNum(opp.peak, 0, 100, 0);
+
+      let ghostScore = 0.4;
+      if (killsByGhost > 0) ghostScore = 1.0;
+      else if (!won && oppPeak > peak) ghostScore = 0.75;
+      else if (won || killedByPlayer > 0) ghostScore = 0.0;
+
+      const expectedGhost = 1 / (1 + Math.pow(10, (challengerElo - gRow.elo) / 400));
+      let delta = Math.round(24 * (ghostScore - expectedGhost));
+      delta = Math.max(-18, Math.min(24, delta));
+
+      const newGhostElo = Math.max(100, gRow.elo + delta);
+      const ghostWon = ghostScore >= 0.75 ? 1 : 0;
+
+      await env.DB.prepare(
+        "UPDATE ghosts SET elo = ?, kills = kills + ?, matches = matches + 1, wins = wins + ? WHERE id = ?"
+      ).bind(newGhostElo, killsByGhost, ghostWon, gRow.id).run();
+
+      const label = gRow.owner_name + "#" + gRow.slot_num;
+      await env.DB.prepare(
+        "INSERT INTO battle_logs (owner_user_id, ghost_label, challenger_name, ghost_kills, ghost_won, elo_delta, seen, created_at) VALUES (?, ?, ?, ?, ?, ?, 0, ?)"
+      ).bind(gRow.user_id, label, challengerName, killsByGhost, ghostWon, delta, Date.now()).run();
+
+      eloUpdates.push({ label, delta, newElo: newGhostElo });
+    }
+  }
+
+  // 2. Update Player ELO & Stats (if logged in)
+  let playerDelta = 0;
+  let updatedUser = user;
+  if (user) {
+    if (ranked && oppCount > 0) {
+      const avgOppElo = oppEloSum / oppCount;
+      const expectedPlayer = 1 / (1 + Math.pow(10, (avgOppElo - user.elo) / 400));
+      const playerScore = won ? 1.0 : Math.min(0.6, kills * 0.12);
+      playerDelta = Math.round(26 * (playerScore - expectedPlayer));
+      playerDelta = Math.max(-16, Math.min(28, playerDelta));
+    }
+    const newPlayerElo = Math.max(100, user.elo + playerDelta);
+    const newPeak = Math.max(user.peak, peak);
+
+    await env.DB.prepare(
+      "UPDATE users SET elo = ?, peak = ?, kills = kills + ?, wins = wins + ?, games = games + 1 WHERE id = ?"
+    ).bind(newPlayerElo, newPeak, kills, won ? 1 : 0, user.id).run();
+
+    updatedUser = {
+      ...user,
+      elo: newPlayerElo,
+      peak: newPeak,
+      kills: user.kills + kills,
+      wins: user.wins + (won ? 1 : 0),
+      games: user.games + 1,
+    };
+  }
+
+  // 3. Save Player's New Ghost to D1 + KV (if logged in and run had >= 40 decisions)
+  let ghostSaved = false;
+  let ghostMsg = "";
+  if (user && ns >= 40 && round.model) {
+    const existingRes = await env.DB.prepare(
+      "SELECT id, slot_num, elo, locked, kv_key FROM ghosts WHERE user_id = ? ORDER BY locked ASC, elo ASC, id ASC"
+    ).bind(user.id).all();
+    const existingGhosts = existingRes.results || [];
+
+    let slotNum = 1;
+    let evicted = null;
+
+    if (existingGhosts.length < 5) {
+      const usedSlots = new Set(existingGhosts.map((g) => g.slot_num));
+      while (usedSlots.has(slotNum) && slotNum <= 5) slotNum++;
+    } else {
+      evicted = existingGhosts.find((g) => g.locked === 0) || null;
+      if (!evicted) {
+        ghostMsg = "All 5 ghost slots are locked — unlock one to save new ghosts.";
+      } else {
+        slotNum = evicted.slot_num;
+      }
+    }
+
+    if (existingGhosts.length < 5 || evicted) {
+      if (evicted) {
+        await env.DB.prepare("DELETE FROM ghosts WHERE id = ?").bind(evicted.id).run();
+        try { await env.KV.delete(evicted.kv_key); } catch {}
+      }
+      const kvKey = "ghost:" + user.id + ":" + Date.now() + ":" + randomHex(4);
+      const badge = classifyGhostBadge(aggr, caut, maxTrail);
+      const brainPayload = JSON.stringify({
+        model: round.model,
+        trips: Array.isArray(round.trips) ? round.trips.slice(0, 40) : [],
+      });
+
+      await env.KV.put(kvKey, brainPayload);
+      await env.DB.prepare(
+        "INSERT INTO ghosts (user_id, owner_name, slot_num, badge, peak, aggr, caut, max_trail, elo, kills, matches, wins, locked, kv_key, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1000, 0, 0, 0, 0, ?, ?)"
+      ).bind(user.id, user.username, slotNum, badge, peak, aggr, caut, maxTrail, kvKey, Date.now()).run();
+
+      ghostSaved = true;
+      ghostMsg = "Saved as " + user.username + "#" + slotNum + " (" + badge + ")";
+    }
+  } else if (!user && ns >= 40) {
+    ghostMsg = "Login/Register to save your ghosts online & climb the leaderboard!";
+  }
+
+  return jsonRes({
+    ok: true,
+    user: updatedUser,
+    playerDelta,
+    eloUpdates,
+    ghostSaved,
+    ghostMsg,
+  });
+}
+
+async function handleManageGhost(request, env) {
+  const user = await getAuthUser(request, env);
+  if (!user) return jsonRes({ ok: false, error: "Unauthorized" }, 401);
+
+  let body;
+  try { body = await request.json(); } catch { return jsonRes({ ok: false, error: "Invalid JSON" }, 400); }
+
+  const ghostId = Number(body.ghostId || 0);
+  const action = body.action;
+
+  const ghost = await env.DB.prepare(
+    "SELECT id, user_id, locked, kv_key FROM ghosts WHERE id = ? AND user_id = ?"
+  ).bind(ghostId, user.id).first();
+
+  if (!ghost) return jsonRes({ ok: false, error: "Ghost not found" }, 404);
+
+  if (action === "toggle_lock") {
+    const nextLock = ghost.locked ? 0 : 1;
+    await env.DB.prepare("UPDATE ghosts SET locked = ? WHERE id = ?").bind(nextLock, ghost.id).run();
+    return jsonRes({ ok: true, locked: nextLock });
+  } else if (action === "delete") {
+    await env.DB.prepare("DELETE FROM ghosts WHERE id = ?").bind(ghost.id).run();
+    try { await env.KV.delete(ghost.kv_key); } catch {}
+    return jsonRes({ ok: true });
+  }
+
+  return jsonRes({ ok: false, error: "Unknown action" }, 400);
+}
+
+// ============================================================================
+// CLIENT GAME HTML & ENGINE (MOBILE-FIRST PAPER.IO + BEHAVIORAL CLONING)
+// Note: Zero backticks are used inside HTML template string to prevent early termination.
+// ============================================================================
 const HTML = String.raw`<!doctype html>
 <html lang="en">
 <head>
@@ -26,17 +463,32 @@ const HTML = String.raw`<!doctype html>
   #time{margin-left:auto;flex:none;font-weight:700;color:#ff5d73;font-size:14px;letter-spacing:1px}
   #stage{flex:1;position:relative;min-height:0}
   canvas{position:absolute;left:0;top:0;width:100%;height:100%;background:#0a0b16}
-  #ov{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;background:rgba(10,12,24,.85);text-align:center;padding:16px;box-sizing:border-box}
-  #card{background:#1b2040;padding:22px 24px;border-radius:16px;max-width:340px;width:100%;max-height:100%;overflow:auto;box-sizing:border-box;line-height:1.45;font-size:14px}
-  #card h1{margin:0 0 6px;font-size:26px}
-  #card h2{margin:0 0 8px;font-size:22px}
-  .muted{opacity:.7;font-size:12px}
-  button{background:#4da3ff;color:#0f1220;border:0;padding:11px 22px;border-radius:10px;font-weight:700;font-size:16px;margin:10px 4px 0;min-height:44px;touch-action:manipulation}
-  button.alt{background:#2a315c;color:#e8ebff;font-size:13px;padding:8px 14px}
-  table{width:100%;border-collapse:collapse;margin:8px 0;font-size:13px}
-  td{padding:3px 4px;text-align:left}
+  #ov{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;background:rgba(10,12,24,.88);text-align:center;padding:12px;box-sizing:border-box;z-index:10}
+  #card{background:#1b2040;padding:18px 18px;border-radius:16px;max-width:380px;width:100%;max-height:94dvh;overflow-y:auto;box-sizing:border-box;line-height:1.4;font-size:13px;-webkit-overflow-scrolling:touch}
+  #card h1{margin:0 0 4px;font-size:24px}
+  #card h2{margin:0 0 6px;font-size:20px}
+  .muted{opacity:.72;font-size:12px}
+  .bar{display:flex;justify-content:space-between;align-items:center;background:#131730;padding:8px 10px;border-radius:10px;margin-bottom:10px;font-size:12px}
+  .modes{display:grid;grid-template-columns:1fr 1fr 1fr;gap:6px;margin:10px 0}
+  .mbtn{background:#252c54;color:#cfd6ff;border:1px solid transparent;padding:8px 4px;border-radius:10px;font-size:12px;font-weight:600;margin:0;min-height:38px}
+  .mbtn.on{background:#2c396e;border-color:#4da3ff;color:#fff}
+  button{background:#4da3ff;color:#0f1220;border:0;padding:10px 18px;border-radius:10px;font-weight:700;font-size:15px;margin:8px 3px 0;min-height:42px;touch-action:manipulation;cursor:pointer}
+  button.alt{background:#2a315c;color:#e8ebff;font-size:12px;padding:7px 12px;min-height:34px}
+  button.sm{background:#2a315c;color:#e8ebff;font-size:11px;padding:4px 8px;min-height:28px;margin:0 2px}
+  button.danger{background:#4d2336;color:#ff8fa0}
+  button:disabled{opacity:.5}
+  input{width:100%;box-sizing:border-box;background:#10142a;border:1px solid #323c73;color:#fff;padding:10px 12px;border-radius:10px;font-size:14px;margin:6px 0;-webkit-user-select:text;user-select:text}
+  table{width:100%;border-collapse:collapse;margin:8px 0;font-size:12px}
+  th{opacity:.65;font-weight:600;text-align:left;padding:4px;border-bottom:1px solid #2b3363}
+  th:last-child{text-align:right}
+  td{padding:5px 4px;text-align:left;border-bottom:1px solid rgba(255,255,255,.05)}
   td:last-child{text-align:right}
-  .dot{display:inline-block;width:10px;height:10px;border-radius:3px;margin-right:6px}
+  .dot{display:inline-block;width:9px;height:9px;border-radius:3px;margin-right:5px}
+  .report{background:#162836;border:1px solid #2e6f95;border-radius:10px;padding:8px 10px;margin:8px 0;text-align:left;font-size:12px}
+  .pos{color:#59e0a0;font-weight:700}
+  .neg{color:#ff5d73;font-weight:700}
+  .tabs{display:flex;gap:6px;margin:8px 0}
+  .tabs button{flex:1;margin:0}
 </style>
 </head>
 <body>
@@ -56,19 +508,20 @@ const HTML = String.raw`<!doctype html>
 // ============================================================================
 var DX = [1, 0, -1, 0], DY = [0, 1, 0, -1]; // Direction vectors: 0=right, 1=down, 2=left, 3=up
 var COLORS = ['#4da3ff','#ff5d73','#ffc14d','#59e0a0','#c58bff','#ff8f5a','#5ad7e6']; // Entity color palette
-var CRGB = COLORS.map(function(h){ return [parseInt(h.substr(1,2),16), parseInt(h.substr(3,2),16), parseInt(h.substr(5,2),16)]; }); // Pre-parsed RGB tuples for fast minimap pixel buffer writes
-var WALL = '#ff2bd6', OUTSIDE = '#0a0b16', FLOOR = '#161a30'; // Arena visual colors
-var TICK_MS = 100;           // Logic update interval in ms (10 ticks/sec)
-var LIVES = 3;               // Player lives per round
-var MINS = 8;                // Minimum samples required in a context bucket before a ghost trusts it
-var KEY = 'ghostio_runs_v1'; // localStorage key for persisted ghost runs
+var CRGB = COLORS.map(function(h){ return [parseInt(h.substr(1,2),16), parseInt(h.substr(3,2),16), parseInt(h.substr(5,2),16)]; });
+var WALL = '#ff2bd6', OUTSIDE = '#0a0b16', FLOOR = '#161a30';
+var TICK_MS = 100;             // Logic update interval in ms (10 ticks/sec)
+var LIVES = 3;                 // Player lives per round
+var MINS = 8;                  // Minimum samples required in a context bucket before a ghost trusts it
+var KEY = 'ghostio_runs_v1';   // localStorage key for offline/guest fallback ghost runs
+var AUTH_KEY = 'ghostio_tok_v1'; // localStorage key for persisted login session token
 var W = 80, H = 80, N = W * H; // Fixed arena grid size in cells (80x80 = 6400 cells)
 
 
 // ============================================================================
 // [SECTION 2] GLOBAL GAME STATE & DOM REFERENCES
-// Purpose: Holds mutable runtime state, grid buffers, active entities, and DOM
-// nodes used across the simulation and rendering loop.
+// Purpose: Holds mutable runtime state, grid buffers, active entities, and
+// cloud session state (logged-in user, selected match mode, offline report).
 // ============================================================================
 var cv = document.getElementById('cv'), ctx = cv.getContext('2d');
 var chipsEl = document.getElementById('chips'), timeEl = document.getElementById('time');
@@ -85,23 +538,57 @@ var player = null;  // Direct reference to the human player entity
 var tick = 0;       // Logic step counter since round start
 var running = false;// Game loop active flag
 var cell = 16;      // Dynamic pixel size of one grid cell (scaled on resize)
-var dpr = 1, cw = 0, ch = 0; // Canvas CSS dimensions and device pixel ratio
-var q = [];         // Input turn queue (max 2 buffered turns to prevent dropped rapid swipes)
-var tripSum = 0, tripN = 0, trips = []; // Player excursion length stats recorded during the round
-var last = 0, acc = 0; // Fixed-timestep accumulator variables for decoupling logic from render FPS
-var toast = { msg: '', until: 0 }; // Floating feedback notification when player kills an opponent
+var dpr = 1, cw = 0, ch = 0;
+var q = [];         // Input turn queue (max 2 buffered turns)
+var tripSum = 0, tripN = 0, trips = [];
+var last = 0, acc = 0;
+var toast = { msg: '', until: 0 };
+
+// Cloud account & matchmaking state
+var authToken = '';
+try { authToken = localStorage.getItem(AUTH_KEY) || ''; } catch(e) {}
+var currentUser = null;     // Logged-in user object { id, username, elo, peak, kills, wins, games }
+var myCloudGhosts = [];     // User's up-to-5 ghosts stored in D1
+var offlineReport = null;   // Unseen battle report summary fetched on login/open
+var gameMode = 'others';    // 'others' | 'mine' | 'friend' | 'ghost'
+var friendQuery = '';       // Friend username for 'friend' mode
+var challengeGhostId = 0;   // Specific ghost DB ID for 'ghost' (Revenge) mode
+var lastMatchConfig = null; // Stores parameters for instant "Play Again"
 
 // Shared utility helpers
 function rnd(n){ return Math.floor(Math.random() * n); }
 function byId(id){ return ents[id - 1]; }
+function esc(s){
+  return String(s || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
 
 
 // ============================================================================
-// [SECTION 3] STORAGE & GHOST REPOSITORY (LOCALSTORAGE)
-// Purpose: Manages reading/writing recorded runs in localStorage, pruning
-// sparse ML models, and selecting which past ghosts to spawn against the player.
+// [SECTION 3] API CLIENT, AUTH & GHOST REPOSITORY
+// Purpose: Communicates with Cloudflare Worker endpoints (/api/*) for login,
+// matchmaking, leaderboards, and ELO reporting, with localStorage fallback.
 // ============================================================================
-function loadRuns(){
+function apiFetch(path, opts){
+  opts = opts || {};
+  var headers = { 'Content-Type': 'application/json' };
+  if (authToken) headers['Authorization'] = 'Bearer ' + authToken;
+  return fetch(path, {
+    method: opts.method || 'GET',
+    headers: headers,
+    body: opts.body ? JSON.stringify(opts.body) : undefined
+  }).then(function(r){ return r.json(); });
+}
+
+function setToken(tok){
+  authToken = tok || '';
+  try {
+    if (authToken) localStorage.setItem(AUTH_KEY, authToken);
+    else localStorage.removeItem(AUTH_KEY);
+  } catch(e) {}
+}
+
+// Local storage fallback helpers (for Guest mode or offline resilience)
+function loadLocalRuns(){
   try {
     var r = JSON.parse(localStorage.getItem(KEY) || 'null');
     if (r && r.runs) return r;
@@ -109,11 +596,10 @@ function loadRuns(){
   return { n: 0, runs: [] };
 }
 
-function saveRuns(r){
+function saveLocalRuns(r){
   try { localStorage.setItem(KEY, JSON.stringify(r)); } catch(e) {}
 }
 
-// Generates a basic rectangular movement script for fallback BOTs when no ghosts exist yet
 function genDefault(){
   var s = Math.random() < 0.5 ? 1 : 3, out = [];
   for (var i = 0; i < 40; i++){
@@ -122,8 +608,7 @@ function genDefault(){
   return out;
 }
 
-// Selects up to 4 ghosts: the top 3 peak-territory runs + the most recent run (deduplicated)
-function pickGhosts(store){
+function pickLocalGhosts(store){
   var runs = store.runs.slice(), out = [], i;
   var best = runs.slice().sort(function(a, b){ return b.peak - a.peak; });
   var latest = runs.slice().reverse();
@@ -136,7 +621,6 @@ function pickGhosts(store){
   return out;
 }
 
-// Strips under-sampled context keys before saving to keep localStorage payload compact
 function pruneModel(m){
   var o = {}, k, c;
   for (k in m){
@@ -144,6 +628,25 @@ function pruneModel(m){
     if (k.charAt(0) === '4' || c[0] + c[1] + c[2] + c[3] >= MINS) o[k] = c;
   }
   return o;
+}
+
+function refreshSession(){
+  if (!authToken){
+    currentUser = null;
+    myCloudGhosts = [];
+    return Promise.resolve();
+  }
+  return apiFetch('/api/me').then(function(res){
+    if (res && res.ok){
+      currentUser = res.user;
+      myCloudGhosts = res.ghosts || [];
+      if (res.report) offlineReport = res.report;
+    } else {
+      setToken('');
+      currentUser = null;
+      myCloudGhosts = [];
+    }
+  }).catch(function(){});
 }
 
 
@@ -155,17 +658,18 @@ function pruneModel(m){
 function mk(id, name, isPlayer){
   return {
     id: id, name: name, isPlayer: isPlayer, color: COLORS[id - 1],
-    x: 0, y: 0, px: 0, py: 0, d: 0, alive: false, // Grid pos, previous pos (for lerp), heading
+    x: 0, y: 0, px: 0, py: 0, d: 0, alive: false,
     trail: [], exit: -1, respawn: 0, kills: 0, pct: 0, peak: 0, deaths: 0, wait: 0,
+    // Cloud metadata & combat telemetry for ELO:
+    dbId: 0, badge: '', elo: 1000, killsOnPlayer: 0, killedByPlayer: 0,
     // AI & Behavioral Cloning state:
     script: null, si: 0, sc: 0, maxTrail: 20, aggr: 0.4, caut: 0.3,
     idle: 0, goal: -1, since: 0, pend: -1, model: null, ns: 0,
-    chT: 0, chA: 0, fT: 0, fA: 0, // Aggression (chase) & caution (flee) telemetry counters
+    chT: 0, chA: 0, fT: 0, fA: 0,
     trips: null, tpl: null, ti: 0, tc: 0, ret: false, tripOn: false, tseg: [], tp0: 0, tlist: [], tHunt: false
   };
 }
 
-// Finds all cells whose (2*rad+1)^2 neighborhood is completely empty and at least dist away from rivals
 function findSpots(e, rad, dist){
   var spots = [], x, y, dx, dy, n, o, ok;
   for (y = rad; y < H - rad; y++) for (x = rad; x < W - rad; x++){
@@ -182,12 +686,11 @@ function findSpots(e, rad, dist){
   return spots;
 }
 
-// Spawns an entity on a 3x3 starting patch. Returns false if the arena is too full to land.
 function spawn(e, force){
   var x, y, s, spots = findSpots(e, 4, 24);
-  if (!spots.length && e.isPlayer) spots = findSpots(e, 2, 8); // Player accepts tighter spawn gaps
+  if (!spots.length && e.isPlayer) spots = findSpots(e, 2, 8);
   if (spots.length){ s = spots[rnd(spots.length)]; x = s % W; y = (s / W) | 0; }
-  else if (force){ x = 4 + rnd(W - 8); y = 4 + rnd(H - 8); } // Forced placement only on initial round start
+  else if (force){ x = 4 + rnd(W - 8); y = 4 + rnd(H - 8); }
   else return false;
 
   for (var dy2 = -1; dy2 <= 1; dy2++) for (var dx2 = -1; dx2 <= 1; dx2++) {
@@ -196,18 +699,20 @@ function spawn(e, force){
   e.x = x; e.y = y; e.px = x; e.py = y; e.alive = true; e.born = tick;
   e.trail = []; e.pend = -1; e.since = 0; e.exit = -1; e.idle = 0; e.goal = -1;
   e.tripOn = false; e.tpl = null; e.ret = false;
-  // Orient initial heading toward the center of the arena
   var cx = W / 2, cy = H / 2;
   e.d = (Math.abs(cx - x) > Math.abs(cy - y)) ? (x < cx ? 0 : 2) : (y < cy ? 1 : 3);
   return true;
 }
 
-// Eliminates an entity, clears its trail, and transfers all its territory to the killer
 function kill(e, by){
   if (!e.alive) return;
   e.alive = false;
   for (var k = 0; k < e.trail.length; k++) trail[e.trail[k]] = 0;
   e.trail = []; e.pend = -1; e.tripOn = false; e.deaths++;
+
+  // Track direct kills between human player and rival ghosts for ELO updates
+  if (e.isPlayer && by && !by.isPlayer) by.killsOnPlayer = (by.killsOnPlayer || 0) + 1;
+  if (!e.isPlayer && by && by.isPlayer) e.killedByPlayer = (e.killedByPlayer || 0) + 1;
 
   var to = (by && by.alive) ? by.id : 0, moved = 0;
   for (var i = 0; i < N; i++) if (owner[i] === e.id){ owner[i] = to; moved++; }
@@ -215,7 +720,7 @@ function kill(e, by){
     toast.msg = '+' + (moved * 100 / N).toFixed(1) + '% from ' + e.name;
     toast.until = tick + 25;
   }
-  e.respawn = tick + 30; e.wait = 0; // 3-second respawn cooldown (30 ticks)
+  e.respawn = tick + 30; e.wait = 0;
   if (e.isPlayer && navigator.vibrate) navigator.vibrate(80);
 }
 
@@ -225,7 +730,6 @@ function kill(e, by){
 // Purpose: Handles grid movement, deferred trail commitment, loop-closing
 // flood fill, head-on collision resolution, and territory percentage counts.
 // ============================================================================
-// Flood-fills from arena borders to find exterior cells; any unvisited cell is enclosed and claimed
 function fill(id){
   var seen = new Uint8Array(N), st = [];
   function push(i){ if (!seen[i] && owner[i] !== id){ seen[i] = 1; st.push(i); } }
@@ -240,7 +744,6 @@ function fill(id){
   for (var j = 0; j < N; j++) if (!seen[j] && owner[j] !== id) owner[j] = id;
 }
 
-// Converts an entity's trail into owned territory upon returning to home land
 function closeLoop(e){
   if (e.isPlayer){ tripSum += e.trail.length; tripN++; trips.push(e.trail.length); }
   for (var k = 0; k < e.trail.length; k++){ owner[e.trail[k]] = e.id; trail[e.trail[k]] = 0; }
@@ -248,34 +751,31 @@ function closeLoop(e){
   fill(e.id);
 }
 
-// Commits a pending cell to the trail only after the head steps off it (prevents self-cut on head-on)
 function commit(){
   for (var i = 0; i < ents.length; i++){
     var e = ents[i];
     if (!e.alive || e.pend < 0) continue;
     var nx = e.x + DX[e.d], ny = e.y + DY[e.d];
-    if (nx < 0 || ny < 0 || nx >= W || ny >= H) continue; // Stopped at arena wall
+    if (nx < 0 || ny < 0 || nx >= W || ny >= H) continue;
     trail[e.pend] = e.id; e.trail.push(e.pend); e.pend = -1;
   }
 }
 
-// Advances an entity by one cell, checks for trail cuts, and triggers loop closure
 function move(e){
   if (!e.alive) return;
   var ox = e.x, oy = e.y, nx = ox + DX[e.d], ny = oy + DY[e.d];
-  if (nx < 0 || ny < 0 || nx >= W || ny >= H){ e.px = ox; e.py = oy; return; } // Wall stops movement safely
+  if (nx < 0 || ny < 0 || nx >= W || ny >= H){ e.px = ox; e.py = oy; return; }
   var i = ny * W + nx, t = trail[i];
-  if (t && t !== e.id){ kill(byId(t), e); e.kills++; } // Cut rival's trail
+  if (t && t !== e.id){ kill(byId(t), e); e.kills++; }
   e.px = ox; e.py = oy; e.x = nx; e.y = ny;
   if (owner[i] === e.id){
     if (e.trail.length) closeLoop(e);
-  } else if (t !== e.id){ // Own trail is harmless
+  } else if (t !== e.id){
     if (!e.trail.length) e.exit = oy * W + ox;
     e.pend = i;
   }
 }
 
-// Resolves head-on collisions (same target cell or cell swap): larger territory wins; tie kills both
 function resolveHeadOn(){
   var n = ents.length, nx = [], i, j, a, b, tx, ty;
   for (i = 0; i < n; i++){
@@ -293,7 +793,6 @@ function resolveHeadOn(){
   }
 }
 
-// Recalculates territory percentages and eliminates any entity reduced to 0% land
 function recount(){
   var c = new Array(ents.length + 1), i;
   for (i = 0; i < c.length; i++) c[i] = 0;
@@ -313,13 +812,11 @@ function recount(){
 // multi-resolution feature keys, records geometric loop shapes, and measures
 // aggression and caution tendencies.
 // ============================================================================
-// Maps a relative vector (dx, dy) into egocentric quadrants: 0=ahead, 1=right, 2=behind, 3=left
 function sector(e, dx, dy){
   var f = dx * DX[e.d] + dy * DY[e.d], r = dx * DX[(e.d + 1) % 4] + dy * DY[(e.d + 1) % 4];
   return Math.abs(f) >= Math.abs(r) ? (f > 0 ? 0 : 2) : (r > 0 ? 1 : 3);
 }
 
-// Encodes the entity's current state into 5 hierarchical context keys (level 0 = finest, level 4 = coarsest)
 function ctxKeys(e){
   var home = owner[e.y * W + e.x] === e.id, len = e.trail.length + (e.pend >= 0 ? 1 : 0);
   var lb = home ? 0 : len <= 2 ? 1 : len <= 6 ? 2 : len <= 12 ? 3 : len <= 20 ? 4 : len <= 30 ? 5 : 6;
@@ -340,14 +837,12 @@ function ctxKeys(e){
   return ['0' + lb + hs + wl + thr.toString(36) + rb, '1' + lb + hs + tp + rb, '2' + lb + hs + tp, '3' + lb + rb, '4' + (lb ? 1 : 0)];
 }
 
-// Increments action counts (0=straight, 1=right, 2=U-turn, 3=left) across all 5 context levels
 function learn(p, act){
   var ks = ctxKeys(p), m = p.model, k, l;
   for (l = 0; l < ks.length; l++){ k = ks[l]; (m[k] || (m[k] = [0, 0, 0, 0]))[act]++; }
   p.ns++;
 }
 
-// Records the geometric sequence of [steps, relativeTurn] for each excursion outside home land
 function tripTrack(p, rel){
   var out = owner[p.y * W + p.x] !== p.id;
   if (out){
@@ -362,14 +857,12 @@ function tripTrack(p, rel){
   }
 }
 
-// Retains the top 28 highest-yielding loop shapes plus the 12 most recent trips
 function keepTrips(list){
   var a = list.slice().sort(function(x, y){ return y.g - x.g; }), out = a.slice(0, 28), rest = list.slice(-12), i;
   for (i = 0; i < rest.length; i++) if (out.indexOf(rest[i]) < 0) out.push(rest[i]);
   return out;
 }
 
-// Tracks aggression (moving toward nearby rival trails) and caution (retreating home when a head is near)
 function track(p){
   var bd = 11, tx = 0, ty = 0, i, k, o, d;
   for (i = 0; i < ents.length; i++){
@@ -381,7 +874,7 @@ function track(p){
   }
   if (bd <= 10){
     if (Math.abs(tx - p.x - DX[p.d]) + Math.abs(ty - p.y - DY[p.d]) < bd) p.chT++; else p.chA++;
-    p.tHunt = true; // Flag excursion as a chase so it isn't stored as a standard loop template
+    p.tHunt = true;
   }
   if (p.trail.length + (p.pend >= 0 ? 1 : 0) >= 4 && headNear(p)){
     var n = nearestOwn(p);
@@ -415,7 +908,6 @@ function okCell(e, c){
   return nx >= 0 && ny >= 0 && nx < W && ny < H && trail[ny * W + nx] !== e.id;
 }
 
-// Human-like L-shaped pathfinding toward target cell t (avoids diagonal zig-zagging and self-trail overlap)
 function goTo(e, t){
   var tx = t % W, ty = (t / W) | 0, best = -1, bs = 1e9, k, c, nx, ny, sc, d = e.d, ex = tx - e.x, ey = ty - e.y;
   var rem = (d % 2 === 0) ? ex * DX[d] : ey * DY[d];
@@ -435,7 +927,6 @@ function goTo(e, t){
   return best;
 }
 
-// Finds the closest cell owned by entity e to close an active loop
 function nearestOwn(e){
   var best = -1, bd = 1e9, i, d;
   for (i = 0; i < N; i++){
@@ -446,7 +937,6 @@ function nearestOwn(e){
   return best;
 }
 
-// Weighted random selection of a recorded player trip (weighted by territory gained, capped at 120)
 function pickTrip(list){
   var tot = 0, i, r;
   for (i = 0; i < list.length; i++) tot += 1 + Math.min(list[i].g, 120);
@@ -455,9 +945,8 @@ function pickTrip(list){
   return list[0].s;
 }
 
-// Scans for nearby rival trails within an aggression-scaled Manhattan radius
 function hunt(e){
-  if (tick - e.born < 30) return -1; // 3-second spawn grace period
+  if (tick - e.born < 30) return -1;
   var range = 4 + Math.floor(e.aggr * 6), best = -1, bd = 1e9;
   for (var n = 0; n < ents.length; n++){
     var o = ents[n];
@@ -478,7 +967,6 @@ function pickGoal(e){
   return -1;
 }
 
-// Samples a relative turn action from the finest context bucket that meets the MINS sample threshold
 function policy(e){
   var ks = ctxKeys(e), c, t, r, a;
   for (var l = 0; l < 5; l++){
@@ -494,7 +982,6 @@ function policy(e){
   return Math.random() < 0.1 ? (Math.random() < 0.5 ? 1 : 3) : 0;
 }
 
-// Main AI tick controller. Priority: Hunt trail > Retreat home > Replay trip shape > Policy/Script
 function ghostDecide(e){
   var d = e.d, prefs = [], target = -1, k, c, h, s;
   var out = owner[e.y * W + e.x] !== e.id, len = e.trail.length + (e.pend >= 0 ? 1 : 0);
@@ -556,7 +1043,6 @@ function updateMini(){
   mctx.putImageData(mimg, 0, 0);
 }
 
-// Renders one frame; a (0..1) is the sub-tick interpolation factor for 60fps smoothness
 function draw(a){
   if (!ents.length || !cw) return;
   var p = player, vw = cw / cell, vh = ch / cell;
@@ -570,21 +1056,17 @@ function draw(a){
   ctx.fillStyle = OUTSIDE; ctx.fillRect(0, 0, cv.width, cv.height);
   ctx.setTransform(dpr, 0, 0, dpr, -Math.round(camX * cell * dpr), -Math.round(camY * cell * dpr));
 
-  // Arena outer wall border and floor
   ctx.fillStyle = WALL; ctx.fillRect(-cell, -cell, (W + 2) * cell, (H + 2) * cell);
   ctx.fillStyle = FLOOR; ctx.fillRect(0, 0, W * cell, H * cell);
 
-  // Viewport culling bounds (only draw cells visible on screen)
   var x0 = Math.max(0, Math.floor(camX)), x1 = Math.min(W, Math.ceil(camX + vw));
   var y0 = Math.max(0, Math.floor(camY)), y1 = Math.min(H, Math.ceil(camY + vh));
 
-  // Subtle floor grid lines
   ctx.strokeStyle = 'rgba(255,255,255,.05)'; ctx.lineWidth = 1; ctx.beginPath();
   for (x = x0; x <= x1; x++){ ctx.moveTo(x * cell, y0 * cell); ctx.lineTo(x * cell, y1 * cell); }
   for (y = y0; y <= y1; y++){ ctx.moveTo(x0 * cell, y * cell); ctx.lineTo(x1 * cell, y * cell); }
   ctx.stroke();
 
-  // Claimed territory and active trails
   for (y = y0; y < y1; y++) for (x = x0; x < x1; x++){
     i = y * W + x;
     o = owner[i];
@@ -593,12 +1075,10 @@ function draw(a){
     if (o){ ctx.globalAlpha = 0.9; ctx.fillStyle = ents[o - 1].color; ctx.fillRect(x * cell + 1, y * cell + 1, cell - 2, cell - 2); }
   }
 
-  // Inner neon wall glow
   ctx.globalAlpha = 1;
   ctx.strokeStyle = 'rgba(255,43,214,.35)'; ctx.lineWidth = cell * 0.5;
   ctx.strokeRect(cell * 0.25, cell * 0.25, W * cell - cell * 0.5, H * cell - cell * 0.5);
 
-  // Entity heads (ghosts have white eyes to distinguish them from the player)
   for (i = 0; i < ents.length; i++){
     e = ents[i];
     if (!e.alive) continue;
@@ -613,10 +1093,8 @@ function draw(a){
     }
   }
 
-  // Reset transform to screen-space coordinates for HUD overlays
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
 
-  // 3-2-1 respawn countdown overlay when player is dead with lives remaining
   if (!p.alive && p.deaths < LIVES){
     var rem = p.respawn - tick, fs = Math.round(Math.min(cw, ch) * 0.3);
     ctx.globalAlpha = 1;
@@ -628,7 +1106,6 @@ function draw(a){
     ctx.fillText('You died - ' + (LIVES - p.deaths) + (LIVES - p.deaths === 1 ? ' life' : ' lives') + ' left', cw / 2, ch / 2 - fs * 0.75);
   }
 
-  // Floating "+X% from NAME" kill notification
   if (tick < toast.until){
     ctx.globalAlpha = Math.min(1, (toast.until - tick) / 8);
     ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.fillStyle = '#fff';
@@ -637,7 +1114,6 @@ function draw(a){
     ctx.globalAlpha = 1;
   }
 
-  // Top-right minimap with camera viewport indicator and entity dots
   var ms = Math.round(Math.min(92, cw * 0.26)), mx = cw - ms - 6, my = 6;
   ctx.imageSmoothingEnabled = false;
   ctx.globalAlpha = 0.9; ctx.drawImage(mini, mx, my, ms, ms);
@@ -666,9 +1142,9 @@ function resize(){
 
 
 // ============================================================================
-// [SECTION 9] UI, PLAYER INPUTS & ROUND LIFECYCLE
-// Purpose: Manages DOM overlays (start, game over, pause), top leaderboard HUD,
-// touch swipe controls, and the main requestAnimationFrame loop.
+// [SECTION 9] UI SCREENS, LEADERBOARDS, INPUTS & ROUND LIFECYCLE
+// Purpose: Renders Start Lobby, Login/Register, Leaderboards, Ghost Roster,
+// End-of-Round ELO Summary, touch controls, and the main animation loop.
 // ============================================================================
 function turn(nd){
   var lastD = q.length ? q[q.length - 1] : (player ? player.d : 0);
@@ -690,7 +1166,7 @@ function updateHud(){
   for (var i = 0; i < list.length; i++){
     var e = list[i];
     h += '<span class="chip' + (e.isPlayer ? ' me' : '') + '" style="border-color:' + e.color + (e.alive ? '' : ';opacity:.45') + '">' +
-         e.name + ' ' + (e.pct >= 10 ? e.pct.toFixed(0) : e.pct.toFixed(1)) + '%</span>';
+         esc(e.name) + ' ' + (e.pct >= 10 ? e.pct.toFixed(0) : e.pct.toFixed(1)) + '%</span>';
   }
   chipsEl.innerHTML = h;
   var lost = Math.min(LIVES, player.deaths);
@@ -706,7 +1182,6 @@ function roomLeft(){
   return findSpots(player, 4, 0).length > 0;
 }
 
-// Single fixed-timestep simulation step (runs every TICK_MS)
 function step(){
   tick++;
   var i, e;
@@ -737,7 +1212,6 @@ function step(){
   else if (player.alive && tick % 5 === 0 && rivalsOut() && !roomLeft()) endRound('won');
 }
 
-// Main browser animation loop
 function frame(t){
   if (!running) return;
   if (!last) last = t;
@@ -748,26 +1222,93 @@ function frame(t){
   if (running) requestAnimationFrame(frame);
 }
 
-function startRound(){
+function showCard(html){ card.innerHTML = html; ov.style.display = 'flex'; }
+
+// Launches a match by fetching ghosts from D1/KV (with seamless local fallback)
+function launchMatch(opts){
+  opts = opts || {};
+  var mode = opts.mode || gameMode;
+  var targetName = opts.targetName || friendQuery;
+  var ghostId = opts.ghostId || challengeGhostId;
+  lastMatchConfig = { mode: mode, targetName: targetName, ghostId: ghostId };
+
+  var playBtn = document.getElementById('go');
+  if (playBtn){ playBtn.disabled = true; playBtn.textContent = 'Finding Ghosts...'; }
+
+  var fetchPromise;
+  if (mode === 'mine' && !currentUser){
+    // Guest playing against their own local ghosts
+    var localPicks = pickLocalGhosts(loadLocalRuns()).map(function(r){
+      return {
+        dbId: 0, ownerName: 'Me', slotNum: r.id, badge: '👻 Local', elo: 1000,
+        model: r.model || null, trips: r.trips || null, script: r.script || null,
+        maxTrail: r.t90 ? Math.max(10, Math.min(70, Math.round(r.t90 * 1.25 + 4))) : 22,
+        caut: r.caut != null ? r.caut : 0.4,
+        aggr: r.aggr != null ? r.aggr : 0.4
+      };
+    });
+    fetchPromise = Promise.resolve({ ok: true, ghosts: localPicks });
+  } else {
+    fetchPromise = apiFetch('/api/match', {
+      method: 'POST',
+      body: { mode: mode, targetName: targetName, ghostId: ghostId }
+    }).catch(function(){
+      return { ok: true, ghosts: [] };
+    });
+  }
+
+  fetchPromise.then(function(res){
+    if (!res || !res.ok){
+      alert(res && res.error ? res.error : 'Could not start match');
+      showStart();
+      return;
+    }
+    initArenaWithGhosts(res.ghosts || []);
+  });
+}
+
+function initArenaWithGhosts(cloudGhosts){
   owner = new Uint8Array(N); trail = new Uint8Array(N);
   ents = []; tick = 0; q = []; tripSum = 0; tripN = 0; trips = []; toast.until = 0;
-  player = mk(1, 'You', true); player.model = {}; ents.push(player);
 
-  var store = loadRuns(), picks = pickGhosts(store), id = 2, g;
-  picks.forEach(function(r){
-    g = mk(id, 'R' + r.id, false);
+  var myName = currentUser ? currentUser.username : 'You';
+  player = mk(1, myName, true);
+  player.model = {};
+  player.elo = currentUser ? currentUser.elo : 1000;
+  ents.push(player);
+
+  var id = 2, g;
+  cloudGhosts.slice(0, 4).forEach(function(r){
+    var label = (r.ownerName || 'Ghost') + '#' + (r.slotNum || (id - 1));
+    g = mk(id, label, false);
+    g.dbId = r.dbId || 0;
+    g.badge = r.badge || '';
+    g.elo = r.elo || 1000;
     g.model = r.model || null;
     g.trips = r.trips && r.trips.length >= 3 ? r.trips : null;
     g.script = g.model ? null : (r.script && r.script.length >= 3 ? r.script : genDefault());
-    g.maxTrail = r.t90 ? Math.max(10, Math.min(70, Math.round(r.t90 * 1.25 + 4))) : Math.max(10, Math.min(60, Math.round((r.trip || 20) * 1.3 + 4)));
+    g.maxTrail = r.maxTrail || 22;
     g.caut = r.caut != null ? r.caut : 0.4;
-    g.aggr = r.aggr != null ? r.aggr : Math.min(0.9, 0.3 + (r.kills || 0) * 0.12);
-    ents.push(g); id++;
+    g.aggr = r.aggr != null ? r.aggr : 0.4;
+    ents.push(g);
+    id++;
   });
 
-  // Backfill up to 5 total entities with fallback BOTs if fewer than 4 ghosts are saved
+  // Backfill remaining slots up to 5 total entities with local ghosts or fallback BOTs
+  if (ents.length < 5){
+    var localFallbacks = pickLocalGhosts(loadLocalRuns());
+    for (var lf = 0; lf < localFallbacks.length && ents.length < 5; lf++){
+      var lr = localFallbacks[lf];
+      g = mk(id, 'Local#' + lr.id, false);
+      g.model = lr.model || null;
+      g.trips = lr.trips && lr.trips.length >= 3 ? lr.trips : null;
+      g.script = g.model ? null : genDefault();
+      g.maxTrail = 20; g.aggr = lr.aggr || 0.4; g.caut = lr.caut || 0.4;
+      ents.push(g); id++;
+    }
+  }
   while (ents.length < 5){
-    g = mk(id, 'B' + (id - 1), false);
+    g = mk(id, 'BOT-' + (id - 1), false);
     g.script = genDefault(); g.maxTrail = 16 + rnd(12); g.aggr = 0.3 + Math.random() * 0.4;
     ents.push(g); id++;
   }
@@ -780,75 +1321,367 @@ function startRound(){
   requestAnimationFrame(frame);
 }
 
-function showCard(html){ card.innerHTML = html; ov.style.display = 'flex'; }
-
-function runsInfo(){
-  var s = loadRuns(), best = 0;
-  s.runs.forEach(function(r){ if (r.peak > best) best = r.peak; });
-  return { n: s.runs.length, best: best };
-}
-
+// --- Screen 1: Main Start Lobby ---
 function showStart(){
-  var inf = runsInfo();
-  showCard('<h1>&#128123; Ghost.io</h1>' +
-    '<div>Claim land by closing loops. Cross a trail to cut its owner. The <b style="color:' + WALL + '">pink wall</b> is the edge of the arena and just stops you, your own trail is harmless, and you can U-turn any time. Head-on crash: the bigger land wins. <b>Kill someone and you take all their land.</b> You have <b>' + LIVES + ' lives</b> and no time limit. <b>Win by wiping out every rival and leaving no room for them to come back.</b></div>' +
-    '<p>Your opponents are <b>ghosts of your past rounds</b>: each one learned how you played that round (the shape of your loops, how far you go, how hard you chase and when you play it safe).</p>' +
-    '<div class="muted">Swipe anywhere to turn &middot; the minimap (top-right) shows everyone</div>' +
-    '<p class="muted">' + (inf.n ? ('Saved ghosts: ' + inf.n + ' | best: ' + inf.best.toFixed(1) + '%') : 'No ghosts yet &mdash; BOTs will fill in until you have some.') + '</p>' +
-    '<button id="go">Play</button>' +
-    (inf.n ? '<button id="reset" class="alt">Reset ghosts</button>' : ''));
-  document.getElementById('go').onclick = startRound;
-  var rb = document.getElementById('reset');
-  if (rb) rb.onclick = function(){ try { localStorage.removeItem(KEY); } catch(e) {} showStart(); };
+  var accountBar = '';
+  if (currentUser){
+    accountBar = '<div class="bar">' +
+      '<div><b>👤 ' + esc(currentUser.username) + '</b> &middot; <span class="pos">' + currentUser.elo + ' ELO</span></div>' +
+      '<button id="logoutBtn" class="sm">Logout</button>' +
+    '</div>';
+  } else {
+    accountBar = '<div class="bar">' +
+      '<div class="muted">Playing as <b>Guest</b></div>' +
+      '<button id="authOpenBtn" class="sm">Login / Register</button>' +
+    '</div>';
+  }
+
+  var reportHtml = '';
+  if (offlineReport){
+    var deltaClass = offlineReport.netElo >= 0 ? 'pos' : 'neg';
+    var deltaSign = offlineReport.netElo >= 0 ? '+' : '';
+    var logLines = offlineReport.logs.map(function(l){
+      var dStr = (l.elo_delta >= 0 ? '+' : '') + l.elo_delta;
+      return '<div>&bull; <b>' + esc(l.ghost_label) + '</b> vs ' + esc(l.challenger_name) +
+             ' (' + l.ghost_kills + ' kills, ' + dStr + ' ELO)</div>';
+    }).join('');
+    reportHtml = '<div class="report">' +
+      '<div style="display:flex;justify-content:space-between;align-items:center">' +
+        '<b>📬 While You Were Away</b>' +
+        '<button id="dismissRep" class="sm">OK</button>' +
+      '</div>' +
+      '<div>Your ghosts fought <b>' + offlineReport.battles + '</b> battles, scored <b>' + offlineReport.kills +
+      '</b> kills (<span class="' + deltaClass + '">' + deltaSign + offlineReport.netElo + ' ELO</span>)</div>' +
+      '<div class="muted" style="margin-top:4px">' + logLines + '</div>' +
+    '</div>';
+  }
+
+  var friendInputHtml = gameMode === 'friend'
+    ? '<input id="friendInput" placeholder="Enter friend username..." value="' + esc(friendQuery) + '">'
+    : '';
+
+  var ghostCountLabel = currentUser ? (myCloudGhosts.length + '/5') : (loadLocalRuns().runs.length);
+
+  showCard(
+    accountBar +
+    '<h1>&#128123; Ghost.io</h1>' +
+    '<div class="muted">Swipe to claim territory &middot; Cut trails &middot; Fight real players&apos; ghosts</div>' +
+    reportHtml +
+    '<div class="modes">' +
+      '<button id="mOthers" class="mbtn' + (gameMode === 'others' ? ' on' : '') + '">🌍 Vs Others</button>' +
+      '<button id="mMine" class="mbtn' + (gameMode === 'mine' ? ' on' : '') + '">👻 My Ghosts</button>' +
+      '<button id="mFriend" class="mbtn' + (gameMode === 'friend' ? ' on' : '') + '">🎯 Friend</button>' +
+    '</div>' +
+    friendInputHtml +
+    '<button id="go" style="width:100%">Play (' + (gameMode === 'others' ? 'Ranked' : gameMode === 'friend' ? 'Challenge' : 'Practice') + ')</button>' +
+    '<div style="margin-top:8px">' +
+      '<button id="lbBtn" class="alt">🏆 Leaderboards</button>' +
+      '<button id="rosterBtn" class="alt">🧬 My Ghosts (' + ghostCountLabel + ')</button>' +
+    '</div>'
+  );
+
+  if (document.getElementById('logoutBtn')){
+    document.getElementById('logoutBtn').onclick = function(){
+      setToken(''); currentUser = null; myCloudGhosts = []; offlineReport = null; showStart();
+    };
+  }
+  if (document.getElementById('authOpenBtn')){
+    document.getElementById('authOpenBtn').onclick = function(){ showAuth('login'); };
+  }
+  if (document.getElementById('dismissRep')){
+    document.getElementById('dismissRep').onclick = function(){ offlineReport = null; showStart(); };
+  }
+
+  document.getElementById('mOthers').onclick = function(){ gameMode = 'others'; showStart(); };
+  document.getElementById('mMine').onclick = function(){ gameMode = 'mine'; showStart(); };
+  document.getElementById('mFriend').onclick = function(){ gameMode = 'friend'; showStart(); };
+
+  var fi = document.getElementById('friendInput');
+  if (fi) fi.oninput = function(){ friendQuery = fi.value; };
+
+  document.getElementById('go').onclick = function(){
+    if (fi) friendQuery = fi.value.trim();
+    launchMatch({ mode: gameMode, targetName: friendQuery });
+  };
+  document.getElementById('lbBtn').onclick = showLeaderboards;
+  document.getElementById('rosterBtn').onclick = showRoster;
 }
 
+// --- Screen 2: Login & Registration ---
+function showAuth(tab){
+  tab = tab || 'login';
+  showCard(
+    '<h2>' + (tab === 'login' ? 'Login to Account' : 'Create Account') + '</h2>' +
+    '<div class="muted">Save your ghosts online, earn ELO, and play from any phone.</div>' +
+    '<input id="uIn" placeholder="Username (3-14 chars)" maxlength="14">' +
+    '<input id="pIn" type="password" placeholder="Password (min 4 chars)" maxlength="64">' +
+    '<div id="authErr" class="neg" style="min-height:18px;font-size:12px"></div>' +
+    '<button id="subAuth" style="width:100%">' + (tab === 'login' ? 'Login' : 'Create Account') + '</button>' +
+    '<div style="margin-top:8px">' +
+      '<button id="swAuth" class="alt">' + (tab === 'login' ? 'Need an account? Register' : 'Already have an account? Login') + '</button>' +
+      '<button id="backAuth" class="alt">Back</button>' +
+    '</div>'
+  );
+
+  document.getElementById('swAuth').onclick = function(){ showAuth(tab === 'login' ? 'register' : 'login'); };
+  document.getElementById('backAuth').onclick = showStart;
+  document.getElementById('subAuth').onclick = function(){
+    var u = document.getElementById('uIn').value.trim();
+    var p = document.getElementById('pIn').value;
+    var errEl = document.getElementById('authErr');
+    var btn = document.getElementById('subAuth');
+    btn.disabled = true; errEl.textContent = '';
+
+    apiFetch('/api/auth', { method: 'POST', body: { mode: tab, username: u, password: p } })
+      .then(function(res){
+        btn.disabled = false;
+        if (!res || !res.ok){
+          errEl.textContent = (res && res.error) ? res.error : 'Authentication failed';
+          return;
+        }
+        setToken(res.token);
+        currentUser = res.user;
+        refreshSession().then(showStart);
+      })
+      .catch(function(){
+        btn.disabled = false;
+        errEl.textContent = 'Network error. Check your connection.';
+      });
+  };
+}
+
+// --- Screen 3: Global Leaderboards (Top Players & Top Ghosts + Challenge Button) ---
+function showLeaderboards(){
+  showCard('<h2>🏆 Leaderboards</h2><div class="muted">Loading rankings...</div>');
+  apiFetch('/api/leaderboards').then(function(res){
+    if (!res || !res.ok){
+      showCard('<h2>🏆 Leaderboards</h2><div class="neg">Failed to load rankings.</div><button id="bk">Back</button>');
+      document.getElementById('bk').onclick = showStart;
+      return;
+    }
+    var activeTab = 'ghosts';
+    function renderTab(){
+      var tableHtml = '';
+      if (activeTab === 'players'){
+        var pRows = res.players.map(function(p, idx){
+          return '<tr><td><b>#' + (idx + 1) + '</b> ' + esc(p.username) + '</td><td>' + p.peak.toFixed(1) + '%</td><td><b>' + p.elo + '</b></td></tr>';
+        }).join('') || '<tr><td colspan="3" class="muted">No players yet</td></tr>';
+        tableHtml = '<table><tr><th>Player</th><th>Peak</th><th>ELO</th></tr>' + pRows + '</table>';
+      } else {
+        var gRows = res.ghosts.map(function(g, idx){
+          var isMine = currentUser && g.user_id === currentUser.id;
+          var btn = isMine ? '<span class="muted">Yours</span>' : '<button class="sm fightBtn" data-gid="' + g.id + '">⚔️ Fight</button>';
+          return '<tr>' +
+            '<td><b>#' + (idx + 1) + '</b> ' + esc(g.owner_name + '#' + g.slot_num) + '<div class="muted">' + esc(g.badge) + ' &middot; ' + g.kills + ' kills</div></td>' +
+            '<td><b>' + g.elo + '</b><div class="muted">' + g.peak.toFixed(0) + '%</div></td>' +
+            '<td>' + btn + '</td>' +
+          '</tr>';
+        }).join('') || '<tr><td colspan="3" class="muted">No ghosts ranked yet</td></tr>';
+        tableHtml = '<table><tr><th>Ghost</th><th>ELO</th><th>Action</th></tr>' + gRows + '</table>';
+      }
+
+      showCard(
+        '<h2>🏆 Global Rankings</h2>' +
+        '<div class="tabs">' +
+          '<button id="tabG" class="mbtn' + (activeTab === 'ghosts' ? ' on' : '') + '">👻 Top Ghosts</button>' +
+          '<button id="tabP" class="mbtn' + (activeTab === 'players' ? ' on' : '') + '">👤 Top Players</button>' +
+        '</div>' +
+        tableHtml +
+        '<button id="bkLb" class="alt">Back</button>'
+      );
+
+      document.getElementById('tabG').onclick = function(){ activeTab = 'ghosts'; renderTab(); };
+      document.getElementById('tabP').onclick = function(){ activeTab = 'players'; renderTab(); };
+      document.getElementById('bkLb').onclick = showStart;
+
+      var fBtns = card.querySelectorAll('.fightBtn');
+      for (var i = 0; i < fBtns.length; i++){
+        fBtns[i].onclick = function(){
+          var gid = Number(this.getAttribute('data-gid'));
+          challengeGhostId = gid;
+          launchMatch({ mode: 'ghost', ghostId: gid });
+        };
+      }
+    }
+    renderTab();
+  }).catch(function(){
+    showCard('<h2>🏆 Leaderboards</h2><div class="neg">Offline — cannot fetch rankings.</div><button id="bk">Back</button>');
+    document.getElementById('bk').onclick = showStart;
+  });
+}
+
+// --- Screen 4: Player's Ghost Roster Management (Lock / Delete) ---
+function showRoster(){
+  if (!currentUser){
+    showCard(
+      '<h2>🧬 My Ghosts</h2>' +
+      '<div class="muted">You are playing as a Guest. Create a free account to manage up to 5 cloud ghosts, lock your best ones, and earn ELO while offline!</div>' +
+      '<button id="regNow">Login / Register</button>' +
+      '<button id="bkRos" class="alt">Back</button>'
+    );
+    document.getElementById('regNow').onclick = function(){ showAuth('register'); };
+    document.getElementById('bkRos').onclick = showStart;
+    return;
+  }
+
+  var rows = myCloudGhosts.map(function(g){
+    return '<tr>' +
+      '<td><b>' + esc(currentUser.username + '#' + g.slot_num) + '</b><div class="muted">' + esc(g.badge) + ' &middot; ' + g.peak.toFixed(1) + '%</div></td>' +
+      '<td><b>' + g.elo + '</b><div class="muted">' + g.kills + 'K / ' + g.matches + 'M</div></td>' +
+      '<td>' +
+        '<button class="sm lockBtn" data-id="' + g.id + '">' + (g.locked ? '🔒' : '🔓') + '</button>' +
+        '<button class="sm danger delBtn" data-id="' + g.id + '">🗑️</button>' +
+      '</td>' +
+    '</tr>';
+  }).join('') || '<tr><td colspan="3" class="muted">No saved ghosts yet. Play a round to clone your first ghost!</td></tr>';
+
+  showCard(
+    '<h2>🧬 My Ghosts (' + myCloudGhosts.length + '/5)</h2>' +
+    '<div class="muted">Locked (🔒) ghosts are protected from being overwritten by new runs.</div>' +
+    '<table><tr><th>Ghost</th><th>ELO</th><th>Manage</th></tr>' + rows + '</table>' +
+    '<button id="bkRos" class="alt">Back</button>'
+  );
+
+  document.getElementById('bkRos').onclick = showStart;
+
+  var lBtns = card.querySelectorAll('.lockBtn');
+  for (var i = 0; i < lBtns.length; i++){
+    lBtns[i].onclick = function(){
+      var id = Number(this.getAttribute('data-id'));
+      apiFetch('/api/ghosts/manage', { method: 'POST', body: { action: 'toggle_lock', ghostId: id } })
+        .then(function(){ return refreshSession(); })
+        .then(showRoster);
+    };
+  }
+
+  var dBtns = card.querySelectorAll('.delBtn');
+  for (var j = 0; j < dBtns.length; j++){
+    dBtns[j].onclick = function(){
+      var id = Number(this.getAttribute('data-id'));
+      apiFetch('/api/ghosts/manage', { method: 'POST', body: { action: 'delete', ghostId: id } })
+        .then(function(){ return refreshSession(); })
+        .then(showRoster);
+    };
+  }
+}
+
+// --- Screen 5: End of Round & Cloud ELO Sync ---
 function endRound(reason){
   if (!running) return;
   running = false;
   draw(1); updateHud();
-  var store = loadRuns();
-  var saved = player.ns >= 40; // Require at least 40 ticks of player data before saving a new ghost
-  if (saved){
-    var tl = trips.slice().sort(function(a, b){ return a - b; }), cs = player.chT + player.chA;
-    var aggr = cs >= 30 ? Math.max(0.15, Math.min(0.9, (player.chT / cs - 0.4) / 0.4)) : Math.min(0.9, 0.3 + player.kills * 0.12);
-    var fs = player.fT + player.fA, caut = fs >= 8 ? Math.max(0.2, Math.min(0.95, (player.fT / fs - 0.45) / 0.45)) : 0.4;
+
+  var tl = trips.slice().sort(function(a, b){ return a - b; });
+  var cs = player.chT + player.chA;
+  var aggr = cs >= 30 ? Math.max(0.15, Math.min(0.9, (player.chT / cs - 0.4) / 0.4)) : Math.min(0.9, 0.3 + player.kills * 0.12);
+  var fs = player.fT + player.fA;
+  var caut = fs >= 8 ? Math.max(0.2, Math.min(0.95, (player.fT / fs - 0.45) / 0.45)) : 0.4;
+  var maxTrailEst = tl.length ? Math.max(10, Math.min(70, Math.round(tl[Math.floor((tl.length - 1) * 0.9)] * 1.25 + 4))) : 22;
+  var prunedModel = pruneModel(player.model);
+  var bestTrips = keepTrips(player.tlist);
+  var won = reason === 'won';
+
+  // Always save locally as offline backup
+  if (player.ns >= 40){
+    var store = loadLocalRuns();
     store.n++;
     store.runs.push({
-      id: store.n, model: pruneModel(player.model), ns: player.ns,
+      id: store.n, model: prunedModel, ns: player.ns,
       peak: Math.round(player.peak * 10) / 10, trip: tripN ? tripSum / tripN : 20,
       t90: tl.length ? tl[Math.floor((tl.length - 1) * 0.9)] : 20, kills: player.kills,
       aggr: Math.round(aggr * 100) / 100, caut: Math.round(caut * 100) / 100,
-      trips: keepTrips(player.tlist), t: Date.now()
+      trips: bestTrips, t: Date.now()
     });
-    // Cap stored ghosts at 20 by evicting the lowest peak-territory run
     while (store.runs.length > 20){
       var mi = 0;
       for (var k = 1; k < store.runs.length - 1; k++) if (store.runs[k].peak < store.runs[mi].peak) mi = k;
       store.runs.splice(mi, 1);
     }
-    saveRuns(store);
+    saveLocalRuns(store);
   }
 
   var list = ents.slice().sort(function(a, b){ return b.peak - a.peak; }), rows = '', rank = 1;
   for (var i = 0; i < list.length; i++){
     var e = list[i];
     if (e === player) rank = i + 1;
-    rows += '<tr><td><span class="dot" style="background:' + e.color + '"></span>' + (e.isPlayer ? '<b>You</b>' : '&#128123; ' + e.name) +
-            '</td><td>' + e.kills + ' kills</td><td>' + e.peak.toFixed(1) + '%</td></tr>';
+    var badgeTag = e.badge ? (' <span class="muted">(' + esc(e.badge) + ')</span>') : '';
+    rows += '<tr><td><span class="dot" style="background:' + e.color + '"></span>' +
+            (e.isPlayer ? '<b>' + esc(e.name) + '</b>' : '&#128123; ' + esc(e.name) + badgeTag) +
+            '</td><td>' + e.kills + 'K</td><td>' + e.peak.toFixed(1) + '%</td></tr>';
   }
-  var won = reason === 'won';
-  var sub = won ? 'Every rival is out and there is no room left for them to come back' :
-            reason === 'noroom' ? 'No room left for you to come back' : 'You used all ' + LIVES + ' lives';
-  showCard('<h2>' + (won ? 'You win!' : 'Game over') + '</h2>' +
+
+  var sub = won ? 'Every rival is out and no room is left for them to land' :
+            reason === 'noroom' ? 'No room left for you to land' : 'You used all ' + LIVES + ' lives';
+
+  showCard(
+    '<h2>' + (won ? 'You win!' : 'Game over') + '</h2>' +
     '<div class="muted">' + sub + '</div>' +
     '<div>Peak territory: <b>' + player.peak.toFixed(1) + '%</b> &mdash; rank <b>' + rank + '/' + list.length + '</b></div>' +
     '<table>' + rows + '</table>' +
-    '<div class="muted">' + (saved ? 'This round is now a ghost that plays like you (learned from ' + player.ns + ' of your decisions).' : 'Too short to learn from - no ghost saved.') + '</div>' +
-    '<button id="again">Play again</button>');
-  document.getElementById('again').onclick = startRound;
+    '<div id="syncStatus" class="muted" style="margin:6px 0">Syncing results &amp; ghost DNA...</div>' +
+    '<button id="again">Play again</button>' +
+    '<button id="homeBtn" class="alt">Lobby</button>'
+  );
+
+  document.getElementById('again').onclick = function(){ launchMatch(lastMatchConfig || { mode: gameMode }); };
+  document.getElementById('homeBtn').onclick = function(){ refreshSession().then(showStart); };
+
+  // Report match outcome & ghost brain to Cloudflare D1 + KV
+  var oppPayload = [];
+  for (var j = 1; j < ents.length; j++){
+    if (ents[j].dbId > 0){
+      oppPayload.push({
+        dbId: ents[j].dbId,
+        killsOnPlayer: ents[j].killsOnPlayer || 0,
+        killedByPlayer: ents[j].killedByPlayer || 0,
+        peak: Math.round(ents[j].peak * 10) / 10
+      });
+    }
+  }
+
+  var isRanked = !lastMatchConfig || lastMatchConfig.mode !== 'mine';
+
+  apiFetch('/api/report', {
+    method: 'POST',
+    body: {
+      ranked: isRanked,
+      opponents: oppPayload,
+      round: {
+        won: won,
+        peak: Math.round(player.peak * 10) / 10,
+        kills: player.kills,
+        ns: player.ns,
+        aggr: Math.round(aggr * 100) / 100,
+        caut: Math.round(caut * 100) / 100,
+        maxTrail: maxTrailEst,
+        model: player.ns >= 40 ? prunedModel : null,
+        trips: player.ns >= 40 ? bestTrips : []
+      }
+    }
+  }).then(function(res){
+    var st = document.getElementById('syncStatus');
+    if (!st) return;
+    if (!res || !res.ok){
+      st.textContent = 'Saved locally (offline).';
+      return;
+    }
+    if (res.user) currentUser = res.user;
+    var lines = [];
+    if (currentUser && res.playerDelta){
+      var sign = res.playerDelta >= 0 ? '+' : '';
+      var cls = res.playerDelta >= 0 ? 'pos' : 'neg';
+      lines.push('Your ELO: <b>' + currentUser.elo + '</b> (<span class="' + cls + '">' + sign + res.playerDelta + '</span>)');
+    }
+    if (res.ghostMsg) lines.push(esc(res.ghostMsg));
+    else if (player.ns < 40) lines.push('Round too short to clone a ghost (need 40+ moves).');
+    st.innerHTML = lines.join('<br>') || 'Results synced!';
+  }).catch(function(){
+    var st = document.getElementById('syncStatus');
+    if (st) st.textContent = 'Saved locally (network unavailable).';
+  });
 }
 
-// Event listeners: touch swipe input, viewport resize, and auto-pause on tab hide
+// Touch swipe controls, resize, and auto-pause
 var tsx = 0, tsy = 0;
 window.addEventListener('touchstart', function(ev){
   var t = ev.touches[0]; tsx = t.clientX; tsy = t.clientY;
@@ -874,18 +1707,41 @@ document.addEventListener('visibilitychange', function(){
   };
 });
 
-// Entry point
-showStart();
+// Boot sequence: restore session if token exists, then show lobby
+refreshSession().then(showStart);
 })();
 </script>
 </body>
 </html>`;
 
 // ============================================================================
-// CLOUDFLARE WORKER HTTP HANDLER
+// [WORKER SECTION 3] HTTP ROUTER
+// Purpose: Dispatches API requests to D1/KV handlers and serves the HTML game.
 // ============================================================================
 export default {
-  async fetch() {
+  async fetch(request, env) {
+    const url = new URL(request.url);
+    const path = url.pathname;
+
+    if (path === "/api/auth" && request.method === "POST") {
+      return handleAuth(request, env);
+    }
+    if (path === "/api/me" && request.method === "GET") {
+      return handleMe(request, env);
+    }
+    if (path === "/api/leaderboards" && request.method === "GET") {
+      return handleLeaderboards(env);
+    }
+    if (path === "/api/match" && request.method === "POST") {
+      return handleMatch(request, env);
+    }
+    if (path === "/api/report" && request.method === "POST") {
+      return handleReport(request, env);
+    }
+    if (path === "/api/ghosts/manage" && request.method === "POST") {
+      return handleManageGhost(request, env);
+    }
+
     return new Response(HTML, {
       headers: {
         "content-type": "text/html;charset=UTF-8",
