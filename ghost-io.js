@@ -275,4 +275,622 @@ function move(e){
   }
 }
 
-// Resolves head-on collisions (same target cell or cell swap): larger territory wins
+// Resolves head-on collisions (same target cell or cell swap): larger territory wins; tie kills both
+function resolveHeadOn(){
+  var n = ents.length, nx = [], i, j, a, b, tx, ty;
+  for (i = 0; i < n; i++){
+    a = ents[i]; tx = a.x + DX[a.d]; ty = a.y + DY[a.d];
+    nx[i] = (a.alive && tx >= 0 && ty >= 0 && tx < W && ty < H) ? ty * W + tx : a.y * W + a.x;
+  }
+  for (i = 0; i < n; i++) for (j = i + 1; j < n; j++){
+    a = ents[i]; b = ents[j];
+    if (!a.alive || !b.alive) continue;
+    if (nx[i] === nx[j] || (nx[i] === b.y * W + b.x && nx[j] === a.y * W + a.x)){
+      if (a.pct > b.pct){ kill(b, a); a.kills++; }
+      else if (b.pct > a.pct){ kill(a, b); b.kills++; }
+      else { kill(a); kill(b); }
+    }
+  }
+}
+
+// Recalculates territory percentages and eliminates any entity reduced to 0% land
+function recount(){
+  var c = new Array(ents.length + 1), i;
+  for (i = 0; i < c.length; i++) c[i] = 0;
+  for (i = 0; i < N; i++) if (owner[i]) c[owner[i]]++;
+  for (i = 0; i < ents.length; i++){
+    var e = ents[i];
+    e.pct = c[e.id] * 100 / N;
+    if (e.pct > e.peak) e.peak = e.pct;
+    if (e.alive && c[e.id] === 0 && tick > 3) kill(e);
+  }
+}
+
+
+// ============================================================================
+// [SECTION 6] PLAYER BEHAVIOR LEARNING (BEHAVIORAL CLONING)
+// Purpose: Observes player actions every tick, encodes spatial context into
+// multi-resolution feature keys, records geometric loop shapes, and measures
+// aggression and caution tendencies.
+// ============================================================================
+// Maps a relative vector (dx, dy) into egocentric quadrants: 0=ahead, 1=right, 2=behind, 3=left
+function sector(e, dx, dy){
+  var f = dx * DX[e.d] + dy * DY[e.d], r = dx * DX[(e.d + 1) % 4] + dy * DY[(e.d + 1) % 4];
+  return Math.abs(f) >= Math.abs(r) ? (f > 0 ? 0 : 2) : (r > 0 ? 1 : 3);
+}
+
+// Encodes the entity's current state into 5 hierarchical context keys (level 0 = finest, level 4 = coarsest)
+function ctxKeys(e){
+  var home = owner[e.y * W + e.x] === e.id, len = e.trail.length + (e.pend >= 0 ? 1 : 0);
+  var lb = home ? 0 : len <= 2 ? 1 : len <= 6 ? 2 : len <= 12 ? 3 : len <= 20 ? 4 : len <= 30 ? 5 : 6;
+  var hs = (!home && e.exit >= 0) ? sector(e, e.exit % W - e.x, ((e.exit / W) | 0) - e.y) : 0;
+  var x2 = e.x + 2 * DX[e.d], y2 = e.y + 2 * DY[e.d], wl = (x2 < 0 || y2 < 0 || x2 >= W || y2 >= H) ? 1 : 0;
+  var bd = 9, kind = 0, sx = 0, sy = 0, i, k, o, d;
+  for (i = 0; i < ents.length; i++){
+    o = ents[i]; if (o === e || !o.alive) continue;
+    d = Math.abs(o.x - e.x) + Math.abs(o.y - e.y);
+    if (d < bd){ bd = d; kind = 1; sx = o.x; sy = o.y; }
+    for (k = 0; k < o.trail.length; k++){
+      d = Math.abs(o.trail[k] % W - e.x) + Math.abs(((o.trail[k] / W) | 0) - e.y);
+      if (d < bd){ bd = d; kind = 0; sx = o.trail[k] % W; sy = (o.trail[k] / W) | 0; }
+    }
+  }
+  var thr = bd > 8 ? 0 : 1 + kind * 8 + (bd <= 3 ? 0 : 4) + sector(e, sx - e.x, sy - e.y), tp = thr ? 1 : 0;
+  var s = e.since, rb = s <= 1 ? 0 : s <= 4 ? s - 1 : s <= 6 ? 4 : s <= 8 ? 5 : s <= 11 ? 6 : s <= 15 ? 7 : s <= 22 ? 8 : 9;
+  return ['0' + lb + hs + wl + thr.toString(36) + rb, '1' + lb + hs + tp + rb, '2' + lb + hs + tp, '3' + lb + rb, '4' + (lb ? 1 : 0)];
+}
+
+// Increments action counts (0=straight, 1=right, 2=U-turn, 3=left) across all 5 context levels
+function learn(p, act){
+  var ks = ctxKeys(p), m = p.model, k, l;
+  for (l = 0; l < ks.length; l++){ k = ks[l]; (m[k] || (m[k] = [0, 0, 0, 0]))[act]++; }
+  p.ns++;
+}
+
+// Records the geometric sequence of [steps, relativeTurn] for each excursion outside home land
+function tripTrack(p, rel){
+  var out = owner[p.y * W + p.x] !== p.id;
+  if (out){
+    if (!p.tripOn){ p.tripOn = true; p.tseg = []; p.tc = 0; p.tp0 = p.pct; p.tHunt = false; }
+    p.tc++;
+    if (rel > 0){ p.tseg.push([Math.min(p.tc, 40), rel]); p.tc = 0; }
+  } else if (p.tripOn){
+    p.tripOn = false;
+    if (p.tseg.length && p.tseg.length <= 10 && !p.tHunt) {
+      p.tlist.push({ g: Math.max(0, Math.round((p.pct - p.tp0) * N / 100)), s: p.tseg });
+    }
+  }
+}
+
+// Retains the top 28 highest-yielding loop shapes plus the 12 most recent trips
+function keepTrips(list){
+  var a = list.slice().sort(function(x, y){ return y.g - x.g; }), out = a.slice(0, 28), rest = list.slice(-12), i;
+  for (i = 0; i < rest.length; i++) if (out.indexOf(rest[i]) < 0) out.push(rest[i]);
+  return out;
+}
+
+// Tracks aggression (moving toward nearby rival trails) and caution (retreating home when a head is near)
+function track(p){
+  var bd = 11, tx = 0, ty = 0, i, k, o, d;
+  for (i = 0; i < ents.length; i++){
+    o = ents[i]; if (o === p || !o.alive) continue;
+    for (k = 0; k < o.trail.length; k++){
+      d = Math.abs(o.trail[k] % W - p.x) + Math.abs(((o.trail[k] / W) | 0) - p.y);
+      if (d < bd){ bd = d; tx = o.trail[k] % W; ty = (o.trail[k] / W) | 0; }
+    }
+  }
+  if (bd <= 10){
+    if (Math.abs(tx - p.x - DX[p.d]) + Math.abs(ty - p.y - DY[p.d]) < bd) p.chT++; else p.chA++;
+    p.tHunt = true; // Flag excursion as a chase so it isn't stored as a standard loop template
+  }
+  if (p.trail.length + (p.pend >= 0 ? 1 : 0) >= 4 && headNear(p)){
+    var n = nearestOwn(p);
+    if (n >= 0){
+      d = Math.abs(n % W - p.x) + Math.abs(((n / W) | 0) - p.y);
+      if (Math.abs(n % W - p.x - DX[p.d]) + Math.abs(((n / W) | 0) - p.y - DY[p.d]) < d) p.fT++; else p.fA++;
+    }
+  }
+}
+
+function headNear(e){
+  for (var i = 0; i < ents.length; i++) {
+    if (ents[i] !== e && ents[i].alive && Math.abs(ents[i].x - e.x) + Math.abs(ents[i].y - e.y) <= 6) return true;
+  }
+  return false;
+}
+
+
+// ============================================================================
+// [SECTION 7] GHOST AI & PATHFINDING
+// Purpose: Executes ghost decision-making each tick by blending target hunting,
+// safe retreats, recorded player loop replays, and probabilistic policy lookups.
+// ============================================================================
+function safe(e, c){
+  var nx = e.x + DX[c], ny = e.y + DY[c];
+  return nx >= 0 && ny >= 0 && nx < W && ny < H;
+}
+
+function okCell(e, c){
+  var nx = e.x + DX[c], ny = e.y + DY[c];
+  return nx >= 0 && ny >= 0 && nx < W && ny < H && trail[ny * W + nx] !== e.id;
+}
+
+// Human-like L-shaped pathfinding toward target cell t (avoids diagonal zig-zagging and self-trail overlap)
+function goTo(e, t){
+  var tx = t % W, ty = (t / W) | 0, best = -1, bs = 1e9, k, c, nx, ny, sc, d = e.d, ex = tx - e.x, ey = ty - e.y;
+  var rem = (d % 2 === 0) ? ex * DX[d] : ey * DY[d];
+  var side = (d % 2 === 0) ? ey : ex;
+  if (rem > 0 && okCell(e, d)) return d;
+  if (rem <= 0 && side !== 0){
+    c = (d % 2 === 0) ? (side > 0 ? 1 : 3) : (side > 0 ? 0 : 2);
+    if (okCell(e, c)) return c;
+  }
+  for (k = 0; k < 3; k++){
+    c = (e.d + (k === 0 ? 0 : k === 1 ? 1 : 3)) % 4;
+    nx = e.x + DX[c]; ny = e.y + DY[c];
+    if (nx < 0 || ny < 0 || nx >= W || ny >= H) continue;
+    sc = Math.abs(tx - nx) + Math.abs(ty - ny) + (trail[ny * W + nx] === e.id ? 6 : 0) + (k ? 0.5 : 0);
+    if (sc < bs){ bs = sc; best = c; }
+  }
+  return best;
+}
+
+// Finds the closest cell owned by entity e to close an active loop
+function nearestOwn(e){
+  var best = -1, bd = 1e9, i, d;
+  for (i = 0; i < N; i++){
+    if (owner[i] !== e.id) continue;
+    d = Math.abs(i % W - e.x) + Math.abs(((i / W) | 0) - e.y);
+    if (d < bd){ bd = d; best = i; }
+  }
+  return best;
+}
+
+// Weighted random selection of a recorded player trip (weighted by territory gained, capped at 120)
+function pickTrip(list){
+  var tot = 0, i, r;
+  for (i = 0; i < list.length; i++) tot += 1 + Math.min(list[i].g, 120);
+  r = Math.random() * tot;
+  for (i = 0; i < list.length; i++){ r -= 1 + Math.min(list[i].g, 120); if (r < 0) return list[i].s; }
+  return list[0].s;
+}
+
+// Scans for nearby rival trails within an aggression-scaled Manhattan radius
+function hunt(e){
+  if (tick - e.born < 30) return -1; // 3-second spawn grace period
+  var range = 4 + Math.floor(e.aggr * 6), best = -1, bd = 1e9;
+  for (var n = 0; n < ents.length; n++){
+    var o = ents[n];
+    if (o === e || !o.alive || !o.trail.length) continue;
+    for (var k = 0; k < o.trail.length; k++){
+      var i = o.trail[k], d = Math.abs((i % W) - e.x) + Math.abs(((i / W) | 0) - e.y);
+      if (d < bd){ bd = d; best = i; }
+    }
+  }
+  return bd <= range ? best : -1;
+}
+
+function pickGoal(e){
+  for (var t = 0; t < 40; t++){
+    var i = rnd(N), x = i % W, y = (i / W) | 0;
+    if (owner[i] !== e.id && x > 1 && y > 1 && x < W - 2 && y < H - 2) return i;
+  }
+  return -1;
+}
+
+// Samples a relative turn action from the finest context bucket that meets the MINS sample threshold
+function policy(e){
+  var ks = ctxKeys(e), c, t, r, a;
+  for (var l = 0; l < 5; l++){
+    c = e.model[ks[l]];
+    if (!c) continue;
+    t = c[0] + c[1] + c[2] + c[3];
+    if (t >= MINS || l === 4){
+      r = Math.random() * t;
+      for (a = 0; a < 4; a++){ r -= c[a]; if (r < 0) return a; }
+      return 0;
+    }
+  }
+  return Math.random() < 0.1 ? (Math.random() < 0.5 ? 1 : 3) : 0;
+}
+
+// Main AI tick controller. Priority: Hunt trail > Retreat home > Replay trip shape > Policy/Script
+function ghostDecide(e){
+  var d = e.d, prefs = [], target = -1, k, c, h, s;
+  var out = owner[e.y * W + e.x] !== e.id, len = e.trail.length + (e.pend >= 0 ? 1 : 0);
+  e.idle = (!out && !len) ? e.idle + 1 : 0;
+  if (!e.model) e.sc++;
+  if (!out){ e.tpl = null; e.ret = false; }
+  else if (len > e.maxTrail) e.ret = true;
+  else if (len >= 4 && !e.ret && headNear(e) && Math.random() < e.caut) e.ret = true;
+
+  h = hunt(e);
+  if (h >= 0){ target = h; e.tpl = null; e.ret = true; e.goal = -1; }
+  else if (e.ret){ target = nearestOwn(e); }
+  else if (!out && e.idle > (e.model ? 40 : 14)){
+    if (e.goal < 0 || owner[e.goal] === e.id) e.goal = pickGoal(e);
+    target = e.goal;
+  } else {
+    e.goal = -1;
+    if (e.model && out && e.trips){
+      if (!e.tpl){ e.tpl = pickTrip(e.trips); e.ti = 0; e.tc = 0; }
+      e.tc++;
+      if (e.ti < e.tpl.length){
+        if (e.tc >= e.tpl[e.ti][0]){ prefs = [(d + e.tpl[e.ti][1]) % 4]; e.tc = 0; e.ti++; }
+      } else { e.ret = true; target = nearestOwn(e); }
+    }
+  }
+
+  if (target >= 0){ c = goTo(e, target); if (c >= 0) prefs = [c]; }
+  else if (!prefs.length && !(e.model && e.trips)){
+    if (e.model){ c = policy(e); if (c) prefs = [(d + c) % 4]; }
+    else {
+      s = e.script[e.si % e.script.length];
+      if (e.sc >= s[0]){ prefs = [(d + s[1]) % 4]; e.sc = 0; e.si++; }
+    }
+  }
+
+  var order = prefs.concat(Math.random() < 0.5 ? [d, (d + 1) % 4, (d + 3) % 4, (d + 2) % 4] : [d, (d + 3) % 4, (d + 1) % 4, (d + 2) % 4]);
+  for (k = 0; k < order.length; k++){
+    if (safe(e, order[k])){ e.d = order[k]; break; }
+  }
+  if (e.d !== d) e.since = 0;
+  e.since++;
+}
+
+
+// ============================================================================
+// [SECTION 8] GRAPHICS & RENDERING ENGINE (CANVAS & MINIMAP)
+// Purpose: Renders the viewport-culled arena, smooth sub-tick interpolated
+// heads, territory/trails, respawn overlays, kill toasts, and the minimap.
+// ============================================================================
+function updateMini(){
+  var d = mimg.data, i, o;
+  for (i = 0; i < N; i++){
+    o = owner[i];
+    d[i * 4] = o ? CRGB[o - 1][0] : 22;
+    d[i * 4 + 1] = o ? CRGB[o - 1][1] : 26;
+    d[i * 4 + 2] = o ? CRGB[o - 1][2] : 48;
+    d[i * 4 + 3] = 255;
+  }
+  mctx.putImageData(mimg, 0, 0);
+}
+
+// Renders one frame; a (0..1) is the sub-tick interpolation factor for 60fps smoothness
+function draw(a){
+  if (!ents.length || !cw) return;
+  var p = player, vw = cw / cell, vh = ch / cell;
+  var hx = p.px + (p.x - p.px) * a + 0.5, hy = p.py + (p.y - p.py) * a + 0.5;
+  var camX = Math.max(-2, Math.min(W + 2 - vw, hx - vw / 2));
+  var camY = Math.max(-2, Math.min(H + 2 - vh, hy - vh / 2));
+  var i, o, x, y, e;
+
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.globalAlpha = 1;
+  ctx.fillStyle = OUTSIDE; ctx.fillRect(0, 0, cv.width, cv.height);
+  ctx.setTransform(dpr, 0, 0, dpr, -Math.round(camX * cell * dpr), -Math.round(camY * cell * dpr));
+
+  // Arena outer wall border and floor
+  ctx.fillStyle = WALL; ctx.fillRect(-cell, -cell, (W + 2) * cell, (H + 2) * cell);
+  ctx.fillStyle = FLOOR; ctx.fillRect(0, 0, W * cell, H * cell);
+
+  // Viewport culling bounds (only draw cells visible on screen)
+  var x0 = Math.max(0, Math.floor(camX)), x1 = Math.min(W, Math.ceil(camX + vw));
+  var y0 = Math.max(0, Math.floor(camY)), y1 = Math.min(H, Math.ceil(camY + vh));
+
+  // Subtle floor grid lines
+  ctx.strokeStyle = 'rgba(255,255,255,.05)'; ctx.lineWidth = 1; ctx.beginPath();
+  for (x = x0; x <= x1; x++){ ctx.moveTo(x * cell, y0 * cell); ctx.lineTo(x * cell, y1 * cell); }
+  for (y = y0; y <= y1; y++){ ctx.moveTo(x0 * cell, y * cell); ctx.lineTo(x1 * cell, y * cell); }
+  ctx.stroke();
+
+  // Claimed territory and active trails
+  for (y = y0; y < y1; y++) for (x = x0; x < x1; x++){
+    i = y * W + x;
+    o = owner[i];
+    if (o){ ctx.globalAlpha = 0.42; ctx.fillStyle = ents[o - 1].color; ctx.fillRect(x * cell, y * cell, cell, cell); }
+    o = trail[i];
+    if (o){ ctx.globalAlpha = 0.9; ctx.fillStyle = ents[o - 1].color; ctx.fillRect(x * cell + 1, y * cell + 1, cell - 2, cell - 2); }
+  }
+
+  // Inner neon wall glow
+  ctx.globalAlpha = 1;
+  ctx.strokeStyle = 'rgba(255,43,214,.35)'; ctx.lineWidth = cell * 0.5;
+  ctx.strokeRect(cell * 0.25, cell * 0.25, W * cell - cell * 0.5, H * cell - cell * 0.5);
+
+  // Entity heads (ghosts have white eyes to distinguish them from the player)
+  for (i = 0; i < ents.length; i++){
+    e = ents[i];
+    if (!e.alive) continue;
+    var ex = (e.px + (e.x - e.px) * a) * cell, ey = (e.py + (e.y - e.py) * a) * cell;
+    ctx.fillStyle = e.color; ctx.fillRect(ex - 1, ey - 1, cell + 2, cell + 2);
+    ctx.strokeStyle = '#fff'; ctx.lineWidth = e.isPlayer ? 2 : 1; ctx.strokeRect(ex - 1, ey - 1, cell + 2, cell + 2);
+    if (!e.isPlayer){
+      ctx.fillStyle = '#fff';
+      var s = Math.max(2, cell * 0.2);
+      ctx.fillRect(ex + cell * 0.2, ey + cell * 0.25, s, s);
+      ctx.fillRect(ex + cell * 0.6, ey + cell * 0.25, s, s);
+    }
+  }
+
+  // Reset transform to screen-space coordinates for HUD overlays
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+  // 3-2-1 respawn countdown overlay when player is dead with lives remaining
+  if (!p.alive && p.deaths < LIVES){
+    var rem = p.respawn - tick, fs = Math.round(Math.min(cw, ch) * 0.3);
+    ctx.globalAlpha = 1;
+    ctx.fillStyle = 'rgba(10,12,24,.5)'; ctx.fillRect(0, 0, cw, ch);
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.fillStyle = '#fff';
+    ctx.font = '700 ' + fs + 'px system-ui,sans-serif';
+    ctx.fillText(rem > 0 ? String(Math.ceil(rem / 10)) : '...', cw / 2, ch / 2);
+    ctx.font = '600 16px system-ui,sans-serif';
+    ctx.fillText('You died - ' + (LIVES - p.deaths) + (LIVES - p.deaths === 1 ? ' life' : ' lives') + ' left', cw / 2, ch / 2 - fs * 0.75);
+  }
+
+  // Floating "+X% from NAME" kill notification
+  if (tick < toast.until){
+    ctx.globalAlpha = Math.min(1, (toast.until - tick) / 8);
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.fillStyle = '#fff';
+    ctx.font = '700 18px system-ui,sans-serif';
+    ctx.fillText(toast.msg, cw / 2, ch - 40);
+    ctx.globalAlpha = 1;
+  }
+
+  // Top-right minimap with camera viewport indicator and entity dots
+  var ms = Math.round(Math.min(92, cw * 0.26)), mx = cw - ms - 6, my = 6;
+  ctx.imageSmoothingEnabled = false;
+  ctx.globalAlpha = 0.9; ctx.drawImage(mini, mx, my, ms, ms);
+  ctx.globalAlpha = 1;
+  ctx.strokeStyle = WALL; ctx.lineWidth = 2; ctx.strokeRect(mx, my, ms, ms);
+  ctx.save(); ctx.beginPath(); ctx.rect(mx, my, ms, ms); ctx.clip();
+  ctx.strokeStyle = 'rgba(255,255,255,.8)'; ctx.lineWidth = 1;
+  ctx.strokeRect(mx + camX / W * ms, my + camY / H * ms, vw / W * ms, vh / H * ms);
+  ctx.restore();
+  for (i = 0; i < ents.length; i++){
+    e = ents[i];
+    if (!e.alive) continue;
+    var dx = mx + (e.x + 0.5) / W * ms, dy = my + (e.y + 0.5) / H * ms, r = e.isPlayer ? 3 : 2;
+    ctx.fillStyle = e.isPlayer ? '#fff' : e.color;
+    ctx.fillRect(dx - r, dy - r, r * 2, r * 2);
+  }
+}
+
+function resize(){
+  cw = stage.clientWidth; ch = stage.clientHeight;
+  cell = Math.max(12, Math.min(28, Math.round(Math.min(cw, ch) / 22)));
+  dpr = Math.min(2, window.devicePixelRatio || 1);
+  cv.width = Math.round(cw * dpr); cv.height = Math.round(ch * dpr);
+  draw(1);
+}
+
+
+// ============================================================================
+// [SECTION 9] UI, PLAYER INPUTS & ROUND LIFECYCLE
+// Purpose: Manages DOM overlays (start, game over, pause), top leaderboard HUD,
+// touch swipe controls, and the main requestAnimationFrame loop.
+// ============================================================================
+function turn(nd){
+  var lastD = q.length ? q[q.length - 1] : (player ? player.d : 0);
+  if (nd === lastD) return;
+  if (q.length < 2) q.push(nd);
+}
+
+function playerDecide(p){
+  var nd = q.length ? q.shift() : -1, turned = nd >= 0 && nd !== p.d, rel = turned ? (nd - p.d + 4) % 4 : 0;
+  learn(p, rel);
+  tripTrack(p, rel);
+  if (turned){ p.d = nd; p.since = 0; }
+  p.since++;
+  track(p);
+}
+
+function updateHud(){
+  var list = ents.slice().sort(function(a, b){ return b.pct - a.pct; }), h = '';
+  for (var i = 0; i < list.length; i++){
+    var e = list[i];
+    h += '<span class="chip' + (e.isPlayer ? ' me' : '') + '" style="border-color:' + e.color + (e.alive ? '' : ';opacity:.45') + '">' +
+         e.name + ' ' + (e.pct >= 10 ? e.pct.toFixed(0) : e.pct.toFixed(1)) + '%</span>';
+  }
+  chipsEl.innerHTML = h;
+  var lost = Math.min(LIVES, player.deaths);
+  timeEl.textContent = '♥'.repeat(LIVES - lost) + '♡'.repeat(lost);
+}
+
+function rivalsOut(){
+  for (var i = 1; i < ents.length; i++) if (ents[i].alive) return false;
+  return true;
+}
+
+function roomLeft(){
+  return findSpots(player, 4, 0).length > 0;
+}
+
+// Single fixed-timestep simulation step (runs every TICK_MS)
+function step(){
+  tick++;
+  var i, e;
+  for (i = 0; i < ents.length; i++){
+    e = ents[i];
+    if (!e.alive){
+      if (tick >= e.respawn && (!e.isPlayer || e.deaths < LIVES)){
+        if (spawn(e)){
+          e.si = 0; e.sc = 0;
+          if (e.isPlayer){ q = []; e.since = 0; }
+        } else {
+          e.respawn = tick + 5; e.wait += 5;
+          if (e.isPlayer && e.wait >= 30) endRound('noroom');
+        }
+      }
+      continue;
+    }
+    if (e.isPlayer) playerDecide(e); else ghostDecide(e);
+  }
+  if (!running) return;
+  resolveHeadOn();
+  commit();
+  for (i = 0; i < ents.length; i++) move(ents[i]);
+  recount();
+  updateMini();
+  if (tick % 3 === 0) updateHud();
+  if (!player.alive && player.deaths >= LIVES) endRound('lives');
+  else if (player.alive && tick % 5 === 0 && rivalsOut() && !roomLeft()) endRound('won');
+}
+
+// Main browser animation loop
+function frame(t){
+  if (!running) return;
+  if (!last) last = t;
+  acc += t - last; last = t;
+  if (acc > 500) acc = 500;
+  while (acc >= TICK_MS && running){ acc -= TICK_MS; step(); }
+  draw(running ? acc / TICK_MS : 1);
+  if (running) requestAnimationFrame(frame);
+}
+
+function startRound(){
+  owner = new Uint8Array(N); trail = new Uint8Array(N);
+  ents = []; tick = 0; q = []; tripSum = 0; tripN = 0; trips = []; toast.until = 0;
+  player = mk(1, 'You', true); player.model = {}; ents.push(player);
+
+  var store = loadRuns(), picks = pickGhosts(store), id = 2, g;
+  picks.forEach(function(r){
+    g = mk(id, 'R' + r.id, false);
+    g.model = r.model || null;
+    g.trips = r.trips && r.trips.length >= 3 ? r.trips : null;
+    g.script = g.model ? null : (r.script && r.script.length >= 3 ? r.script : genDefault());
+    g.maxTrail = r.t90 ? Math.max(10, Math.min(70, Math.round(r.t90 * 1.25 + 4))) : Math.max(10, Math.min(60, Math.round((r.trip || 20) * 1.3 + 4)));
+    g.caut = r.caut != null ? r.caut : 0.4;
+    g.aggr = r.aggr != null ? r.aggr : Math.min(0.9, 0.3 + (r.kills || 0) * 0.12);
+    ents.push(g); id++;
+  });
+
+  // Backfill up to 5 total entities with fallback BOTs if fewer than 4 ghosts are saved
+  while (ents.length < 5){
+    g = mk(id, 'B' + (id - 1), false);
+    g.script = genDefault(); g.maxTrail = 16 + rnd(12); g.aggr = 0.3 + Math.random() * 0.4;
+    ents.push(g); id++;
+  }
+
+  for (var i = 0; i < ents.length; i++) spawn(ents[i], true);
+  recount(); updateMini(); updateHud();
+  ov.style.display = 'none';
+  running = true; last = 0; acc = 0;
+  resize();
+  requestAnimationFrame(frame);
+}
+
+function showCard(html){ card.innerHTML = html; ov.style.display = 'flex'; }
+
+function runsInfo(){
+  var s = loadRuns(), best = 0;
+  s.runs.forEach(function(r){ if (r.peak > best) best = r.peak; });
+  return { n: s.runs.length, best: best };
+}
+
+function showStart(){
+  var inf = runsInfo();
+  showCard('<h1>&#128123; Ghost.io</h1>' +
+    '<div>Claim land by closing loops. Cross a trail to cut its owner. The <b style="color:' + WALL + '">pink wall</b> is the edge of the arena and just stops you, your own trail is harmless, and you can U-turn any time. Head-on crash: the bigger land wins. <b>Kill someone and you take all their land.</b> You have <b>' + LIVES + ' lives</b> and no time limit. <b>Win by wiping out every rival and leaving no room for them to come back.</b></div>' +
+    '<p>Your opponents are <b>ghosts of your past rounds</b>: each one learned how you played that round (the shape of your loops, how far you go, how hard you chase and when you play it safe).</p>' +
+    '<div class="muted">Swipe anywhere to turn &middot; the minimap (top-right) shows everyone</div>' +
+    '<p class="muted">' + (inf.n ? ('Saved ghosts: ' + inf.n + ' | best: ' + inf.best.toFixed(1) + '%') : 'No ghosts yet &mdash; BOTs will fill in until you have some.') + '</p>' +
+    '<button id="go">Play</button>' +
+    (inf.n ? '<button id="reset" class="alt">Reset ghosts</button>' : ''));
+  document.getElementById('go').onclick = startRound;
+  var rb = document.getElementById('reset');
+  if (rb) rb.onclick = function(){ try { localStorage.removeItem(KEY); } catch(e) {} showStart(); };
+}
+
+function endRound(reason){
+  if (!running) return;
+  running = false;
+  draw(1); updateHud();
+  var store = loadRuns();
+  var saved = player.ns >= 40; // Require at least 40 ticks of player data before saving a new ghost
+  if (saved){
+    var tl = trips.slice().sort(function(a, b){ return a - b; }), cs = player.chT + player.chA;
+    var aggr = cs >= 30 ? Math.max(0.15, Math.min(0.9, (player.chT / cs - 0.4) / 0.4)) : Math.min(0.9, 0.3 + player.kills * 0.12);
+    var fs = player.fT + player.fA, caut = fs >= 8 ? Math.max(0.2, Math.min(0.95, (player.fT / fs - 0.45) / 0.45)) : 0.4;
+    store.n++;
+    store.runs.push({
+      id: store.n, model: pruneModel(player.model), ns: player.ns,
+      peak: Math.round(player.peak * 10) / 10, trip: tripN ? tripSum / tripN : 20,
+      t90: tl.length ? tl[Math.floor((tl.length - 1) * 0.9)] : 20, kills: player.kills,
+      aggr: Math.round(aggr * 100) / 100, caut: Math.round(caut * 100) / 100,
+      trips: keepTrips(player.tlist), t: Date.now()
+    });
+    // Cap stored ghosts at 20 by evicting the lowest peak-territory run
+    while (store.runs.length > 20){
+      var mi = 0;
+      for (var k = 1; k < store.runs.length - 1; k++) if (store.runs[k].peak < store.runs[mi].peak) mi = k;
+      store.runs.splice(mi, 1);
+    }
+    saveRuns(store);
+  }
+
+  var list = ents.slice().sort(function(a, b){ return b.peak - a.peak; }), rows = '', rank = 1;
+  for (var i = 0; i < list.length; i++){
+    var e = list[i];
+    if (e === player) rank = i + 1;
+    rows += '<tr><td><span class="dot" style="background:' + e.color + '"></span>' + (e.isPlayer ? '<b>You</b>' : '&#128123; ' + e.name) +
+            '</td><td>' + e.kills + ' kills</td><td>' + e.peak.toFixed(1) + '%</td></tr>';
+  }
+  var won = reason === 'won';
+  var sub = won ? 'Every rival is out and there is no room left for them to come back' :
+            reason === 'noroom' ? 'No room left for you to come back' : 'You used all ' + LIVES + ' lives';
+  showCard('<h2>' + (won ? 'You win!' : 'Game over') + '</h2>' +
+    '<div class="muted">' + sub + '</div>' +
+    '<div>Peak territory: <b>' + player.peak.toFixed(1) + '%</b> &mdash; rank <b>' + rank + '/' + list.length + '</b></div>' +
+    '<table>' + rows + '</table>' +
+    '<div class="muted">' + (saved ? 'This round is now a ghost that plays like you (learned from ' + player.ns + ' of your decisions).' : 'Too short to learn from - no ghost saved.') + '</div>' +
+    '<button id="again">Play again</button>');
+  document.getElementById('again').onclick = startRound;
+}
+
+// Event listeners: touch swipe input, viewport resize, and auto-pause on tab hide
+var tsx = 0, tsy = 0;
+window.addEventListener('touchstart', function(ev){
+  var t = ev.touches[0]; tsx = t.clientX; tsy = t.clientY;
+}, { passive: true });
+
+window.addEventListener('touchmove', function(ev){
+  if (!running) return;
+  ev.preventDefault();
+  var t = ev.touches[0], dx = t.clientX - tsx, dy = t.clientY - tsy;
+  if (Math.abs(dx) < 16 && Math.abs(dy) < 16) return;
+  turn(Math.abs(dx) > Math.abs(dy) ? (dx > 0 ? 0 : 2) : (dy > 0 ? 1 : 3));
+  tsx = t.clientX; tsy = t.clientY;
+}, { passive: false });
+
+window.addEventListener('resize', resize);
+
+document.addEventListener('visibilitychange', function(){
+  if (!document.hidden || !running) return;
+  running = false;
+  showCard('<h2>Paused</h2><button id="res">Resume</button>');
+  document.getElementById('res').onclick = function(){
+    ov.style.display = 'none'; running = true; last = 0; acc = 0; requestAnimationFrame(frame);
+  };
+});
+
+// Entry point
+showStart();
+})();
+</script>
+</body>
+</html>`;
+
+// ============================================================================
+// CLOUDFLARE WORKER HTTP HANDLER
+// ============================================================================
+export default {
+  async fetch() {
+    return new Response(HTML, {
+      headers: {
+        "content-type": "text/html;charset=UTF-8",
+        "cache-control": "no-cache",
+      },
+    });
+  },
+};
