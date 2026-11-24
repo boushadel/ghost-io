@@ -64,9 +64,10 @@
 //   - [RULE-11] Player-Derived Tactical Thresholds & Death Screen Attribution:
 //               All loop-closure, home-idle exit, late-game caution, and max
 //               hunting trail thresholds (`maxHuntTrail`, `maxHomeIdle`, `lateCaut`)
-//               must be measured from the player's single round rather than fixed
-//               uniform constants across all ghosts, and the respawn countdown
-//               overlay must display the name and cause of whoever killed the player.
+//               must be measured using robust percentiles from the player's single
+//               round rather than raw outliers or fixed constants, and the respawn
+//               countdown overlay must display the killer's name and cause (including
+//               territory enclosure kills).
 //
 // [C] SYSTEM ARCHITECTURE & DATABASE SCHEMA REFERENCE
 // ----------------------------------------------------------------------------
@@ -392,7 +393,7 @@ async function handleMatch(request, env) {
       } catch {}
       const fallbackMaxHunt = Math.max(4, Math.round((1 - r.caut) * r.max_trail * 0.8 + r.aggr * 6));
       const fallbackAwareness = Math.min(0.95, (r.aggr + r.caut) * 0.6);
-      const fallbackHomeIdle = Math.max(5, Math.round(18 - r.aggr * 10 - fallbackAwareness * 6));
+      const fallbackHomeIdle = Math.max(5, Math.min(20, Math.round(18 - r.aggr * 10 - fallbackAwareness * 6)));
       return {
         dbId: r.id,
         ownerId: r.user_id,
@@ -408,7 +409,7 @@ async function handleMatch(request, env) {
         earlyMaxTrail: brain?.earlyMaxTrail ?? Math.min(r.max_trail, 26),
         lateMaxTrail: brain?.lateMaxTrail ?? r.max_trail,
         maxHuntTrail: brain?.maxHuntTrail ?? fallbackMaxHunt,
-        maxHomeIdle: brain?.maxHomeIdle ?? fallbackHomeIdle,
+        maxHomeIdle: Math.min(20, brain?.maxHomeIdle ?? fallbackHomeIdle),
         wallPref: brain?.wallPref ?? 0.35,
         stealPref: brain?.stealPref ?? 0.3,
         spinBias: brain?.spinBias ?? 0,
@@ -453,8 +454,8 @@ async function handleReport(request, env) {
   const maxTrail = Math.round(clampNum(round.maxTrail, 10, 80, 20));
   const earlyMaxTrail = Math.round(clampNum(round.earlyMaxTrail, 10, 72, Math.min(maxTrail, 24)));
   const lateMaxTrail = Math.round(clampNum(round.lateMaxTrail, 10, 80, maxTrail));
-  const maxHuntTrail = Math.round(clampNum(round.maxHuntTrail, 2, 70, 6));
-  const maxHomeIdle = Math.round(clampNum(round.maxHomeIdle, 4, 40, 10));
+  const maxHuntTrail = Math.round(clampNum(round.maxHuntTrail, 2, 60, 6));
+  const maxHomeIdle = Math.round(clampNum(round.maxHomeIdle, 4, 20, 10));
   const wallPref = Math.round(clampNum(round.wallPref, 0, 1, 0.35) * 100) / 100;
   const stealPref = Math.round(clampNum(round.stealPref, 0, 1, 0.3) * 100) / 100;
   const spinBias = Math.round(clampNum(round.spinBias, -1, 1, 0) * 100) / 100;
@@ -752,6 +753,7 @@ var owner;          // Uint8Array(6400): stores 1-based entity ID owning each ce
 var trail;          // Uint8Array(6400): stores 1-based entity ID of active exposed trail in each cell (0 = none)
 var ents = [];      // Active entity list; ents[0] is always the human player (id=1), ents[1..4] are AI ghosts/bots
 var player = null;  // Direct pointer to ents[0]
+var lastLoopCloser = null; // Entity that closed a loop on the current tick (for attributing 100% territory enclosure kills)
 var tick = 0;       // Monotonic simulation tick counter for the current round
 var running = false;// True while the simulation & animation loop are active
 var cell = 16;      // Dynamic pixel size of 1 grid cell, recalculated on viewport resize
@@ -955,7 +957,7 @@ function mk(id, name, isPlayer){
     chT: 0, chA: 0, fT: 0, fA: 0, lateFT: 0, lateFA: 0,
     wallTicks: 0, totalTicks: 0, stealSteps: 0, neutralSteps: 0,
     rightTurns: 0, leftTurns: 0, uturns: 0, defT: 0, defA: 0,
-    maxObservedHuntTrail: 0, curHomeIdle: 0, maxObservedIdle: 0,
+    huntTrails: [], curHomeIdle: 0, idleDurations: [],
     // FIX RATIONALE [RULE-08] & [RULE-09]: Tracks overall max observed trail plus
     // early-round (<20% land) vs late-round (>=20% land) trail peaks so ghosts mirror
     // how the player scales loop size as they gain map control.
@@ -1031,17 +1033,18 @@ function kill(e, by, cause){
   e.trail = []; e.pend = -1; e.tripOn = false; e.deaths++;
 
   // FIX RATIONALE [RULE-11]: Record killer metadata on player death for the countdown overlay
-  // and track the human player's exposed trail length when scoring a kill.
+  // and record confirmed hunting trail lengths when the human player scores a trail-cut kill.
   if (e.isPlayer){
     e.lastKiller = by ? by.name : '';
     e.lastKillerColor = by ? by.color : '#ff5d73';
     e.lastKillCause = !cause ? 'trail cut' :
                       cause === 'trail-cut' ? 'trail cut' :
+                      cause === 'enclosed' ? 'enclosed' :
                       cause.indexOf('head-on') === 0 ? 'head-on' : cause;
   }
-  if (by && by.isPlayer){
+  if (by && by.isPlayer && cause === 'trail-cut'){
     var killerTrail = by.trail.length + (by.pend >= 0 ? 1 : 0);
-    if (killerTrail > by.maxObservedHuntTrail) by.maxObservedHuntTrail = killerTrail;
+    by.huntTrails.push(killerTrail, killerTrail);
   }
 
   if (e.isPlayer && by && !by.isPlayer) by.killsOnPlayer = (by.killsOnPlayer || 0) + 1;
@@ -1103,6 +1106,7 @@ function closeLoop(e){
   for (var k = 0; k < tLen; k++){ owner[e.trail[k]] = e.id; trail[e.trail[k]] = 0; }
   e.trail = [];
   var enclosed = fill(e.id);
+  if (enclosed > 0) lastLoopCloser = e;
   // [DEV-LOG START]
   var totalCells = tLen + enclosed;
   var gainPct = (totalCells * 100 / N).toFixed(1);
@@ -1180,6 +1184,8 @@ function resolveHeadOn(){
 /**
  * Recalculates live territory percentages for all entities and eliminates
  * any living entity whose territory was completely swallowed (c[e.id] === 0).
+ * FIX RATIONALE [RULE-11]: Attributes 100% territory enclosure kills to
+ * 'lastLoopCloser' when a rival's loop flood-fill swallowed the entity's land.
  */
 function recount(){
   var c = new Array(ents.length + 1), i;
@@ -1189,7 +1195,11 @@ function recount(){
     var e = ents[i];
     e.pct = c[e.id] * 100 / N;
     if (e.pct > e.peak) e.peak = e.pct;
-    if (e.alive && c[e.id] === 0 && tick > 3) kill(e, null, '0%-land');
+    if (e.alive && c[e.id] === 0 && tick > 3){
+      var encloser = (lastLoopCloser && lastLoopCloser !== e && lastLoopCloser.alive) ? lastLoopCloser : null;
+      kill(e, encloser, encloser ? 'enclosed' : '0%-land');
+      if (encloser) encloser.kills++;
+    }
   }
 }
 
@@ -1364,8 +1374,8 @@ function keepTrips(list){
 /**
  * Accumulates continuous behavioral telemetry on every tick to estimate the
  * player's high-level traits: Aggression (chT/chA), Caution (fT/fA & lateFT/lateFA),
- * Wall Preference, Steal Preference, Home Defense (defT/defA), max hunting trail
- * length (maxObservedHuntTrail), home-idle pacing (maxObservedIdle), and phase-scaled
+ * Wall Preference, Steal Preference, Home Defense (defT/defA), hunting trail
+ * samples (huntTrails), home-idle durations (idleDurations), and phase-scaled
  * trail lengths (earlyObservedTrail vs lateObservedTrail).
  */
 function track(p){
@@ -1379,12 +1389,13 @@ function track(p){
     if (curTrail > p.lateObservedTrail) p.lateObservedTrail = curTrail;
   }
 
-  // FIX RATIONALE [RULE-11]: Track how long the human player stays inside home territory
-  // between loops so their ghost learns their natural home-exit tempo instead of a fixed timer.
+  // FIX RATIONALE [RULE-11]: Record completed home-idle intervals into 'idleDurations'
+  // so endRound() can take the 75th percentile rather than letting a single late-game
+  // cross-map transit inflate 'maxHomeIdle' to 35 ticks.
   if (!out && curTrail === 0){
     p.curHomeIdle++;
-    if (p.curHomeIdle > p.maxObservedIdle) p.maxObservedIdle = p.curHomeIdle;
   } else {
+    if (p.curHomeIdle > 0) p.idleDurations.push(p.curHomeIdle);
     p.curHomeIdle = 0;
   }
 
@@ -1395,7 +1406,7 @@ function track(p){
     else p.neutralSteps++;
   }
 
-  // Measure Aggression & Max Hunting Trail: when within 10 tiles of a rival trail, does player close distance?
+  // Measure Aggression & Hunting Trail Distribution: when within 10 tiles of a rival trail, does player close distance?
   var bd = 11, tx = 0, ty = 0, i, k, o, d;
   for (i = 0; i < ents.length; i++){
     o = ents[i]; if (o === p || !o.alive) continue;
@@ -1407,7 +1418,7 @@ function track(p){
   if (bd <= 10){
     if (Math.abs(tx - p.x - DX[p.d]) + Math.abs(ty - p.y - DY[p.d]) < bd){
       p.chT++;
-      if (curTrail > p.maxObservedHuntTrail) p.maxObservedHuntTrail = curTrail;
+      p.huntTrails.push(curTrail);
     } else {
       p.chA++;
     }
@@ -1761,7 +1772,7 @@ function ghostDecide(e){
   var curMaxTrail = effectiveMaxTrail(e);
   var aw = e.awareness != null ? e.awareness : 0.5;
   var activeCaut = (e.pct >= 30 && e.lateCaut != null) ? e.lateCaut : e.caut;
-  var homeIdleLimit = e.maxHomeIdle != null ? e.maxHomeIdle : 10;
+  var homeIdleLimit = Math.min(20, e.maxHomeIdle != null ? e.maxHomeIdle : 10);
 
   if (!out){
     e.tpl = null; e.ret = false;
@@ -2107,6 +2118,7 @@ function roomLeft(){
  */
 function step(){
   tick++;
+  lastLoopCloser = null;
   var i, e;
   for (i = 0; i < ents.length; i++){
     e = ents[i];
@@ -2193,7 +2205,7 @@ function launchMatch(opts){
         earlyMaxTrail: r.earlyMaxTrail != null ? r.earlyMaxTrail : Math.min(mt, 26),
         lateMaxTrail: r.lateMaxTrail != null ? r.lateMaxTrail : mt,
         maxHuntTrail: r.maxHuntTrail != null ? r.maxHuntTrail : Math.max(4, Math.round((1 - cautVal) * mt * 0.8 + aggrVal * 6)),
-        maxHomeIdle: r.maxHomeIdle != null ? r.maxHomeIdle : Math.max(5, Math.round(18 - aggrVal * 10 - awVal * 6)),
+        maxHomeIdle: Math.min(20, r.maxHomeIdle != null ? r.maxHomeIdle : Math.max(5, Math.round(18 - aggrVal * 10 - awVal * 6))),
         caut: cautVal,
         lateCaut: r.lateCaut != null ? r.lateCaut : cautVal,
         aggr: aggrVal,
@@ -2263,7 +2275,7 @@ function initArenaWithGhosts(cloudGhosts){
     g.aggr = r.aggr != null ? r.aggr : 0.4;
     g.awareness = r.awareness != null ? r.awareness : Math.min(0.95, (g.aggr + g.caut) * 0.6);
     g.maxHuntTrail = r.maxHuntTrail != null ? r.maxHuntTrail : Math.max(4, Math.round((1 - g.caut) * g.maxTrail * 0.8 + g.aggr * 6));
-    g.maxHomeIdle = r.maxHomeIdle != null ? r.maxHomeIdle : Math.max(5, Math.round(18 - g.aggr * 10 - g.awareness * 6));
+    g.maxHomeIdle = Math.min(20, r.maxHomeIdle != null ? r.maxHomeIdle : Math.max(5, Math.round(18 - g.aggr * 10 - g.awareness * 6)));
     g.wallPref = r.wallPref != null ? r.wallPref : 0.35;
     g.stealPref = r.stealPref != null ? r.stealPref : 0.3;
     g.spinBias = r.spinBias != null ? r.spinBias : 0;
@@ -2286,7 +2298,7 @@ function initArenaWithGhosts(cloudGhosts){
       g.lateCaut = lr.lateCaut != null ? lr.lateCaut : g.caut;
       g.awareness = lr.awareness != null ? lr.awareness : 0.5;
       g.maxHuntTrail = lr.maxHuntTrail != null ? lr.maxHuntTrail : Math.max(4, Math.round((1 - g.caut) * g.maxTrail * 0.8 + g.aggr * 6));
-      g.maxHomeIdle = lr.maxHomeIdle != null ? lr.maxHomeIdle : Math.max(5, Math.round(18 - g.aggr * 10 - g.awareness * 6));
+      g.maxHomeIdle = Math.min(20, lr.maxHomeIdle != null ? lr.maxHomeIdle : Math.max(5, Math.round(18 - g.aggr * 10 - g.awareness * 6)));
       g.wallPref = lr.wallPref != null ? lr.wallPref : 0.35;
       g.stealPref = lr.stealPref != null ? lr.stealPref : 0.3;
       g.spinBias = lr.spinBias != null ? lr.spinBias : 0;
@@ -2581,9 +2593,9 @@ function endRound(reason){
   draw(1); updateHud();
 
   // Compute Style DNA ratios + early/late trail limits + tactical awareness from this single round
-  // FIX RATIONALE [RULE-10] & [RULE-11]: Allows aggr and caut to drop down to 0.05 for genuinely
-  // passive or reckless players, and computes 'lateCaut', 'maxHuntTrail', and 'maxHomeIdle'
-  // directly from observed player behavior in this round rather than fixed universal rules.
+  // FIX RATIONALE [RULE-10] & [RULE-11]: Uses 80th percentile of 'huntTrails' and 75th percentile
+  // of 'idleDurations' so single-round outliers (e.g., retreating past a rival with a 55-tile trail
+  // or crossing 70% land once at the end of a match) do not inflate 'maxHuntTrail' or 'maxHomeIdle'.
   var tl = trips.slice().sort(function(a, b){ return a - b; });
   var cs = player.chT + player.chA;
   var aggr = cs >= 6 ? Math.max(0.05, Math.min(0.92, (player.chT / cs - 0.30) / 0.50)) : Math.min(0.85, 0.15 + player.kills * 0.15);
@@ -2603,8 +2615,13 @@ function endRound(reason){
   var earlyMaxTrailEst = Math.max(10, Math.min(60, Math.round(earlyRef * 1.12 + 2)));
   var lateMaxTrailEst = Math.max(earlyMaxTrailEst, Math.min(72, Math.round(lateRef * 1.15 + 3)));
 
-  var maxHuntTrailEst = Math.max(3, Math.min(65, Math.round(player.maxObservedHuntTrail + 2)));
-  var maxHomeIdleEst = Math.max(4, Math.min(35, Math.round(player.maxObservedIdle > 0 ? (player.maxObservedIdle + 2) : 8)));
+  var htSorted = player.huntTrails.slice().sort(function(a, b){ return a - b; });
+  var htP80 = htSorted.length ? htSorted[Math.floor((htSorted.length - 1) * 0.8)] : 4;
+  var maxHuntTrailEst = Math.max(3, Math.min(60, Math.round(htP80 + 2)));
+
+  var idSorted = player.idleDurations.slice().sort(function(a, b){ return a - b; });
+  var idP75 = idSorted.length ? idSorted[Math.floor((idSorted.length - 1) * 0.75)] : 6;
+  var maxHomeIdleEst = Math.max(4, Math.min(20, Math.round(idP75 + 2)));
 
   var wallPref = player.totalTicks > 0 ? Math.round((player.wallTicks / player.totalTicks) * 100) / 100 : 0.35;
   var expTotal = player.stealSteps + player.neutralSteps;
