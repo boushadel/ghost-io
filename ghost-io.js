@@ -945,7 +945,7 @@ function mk(id, name, isPlayer){
     // Cloud metadata & combat telemetry for ELO calculation:
     dbId: 0, badge: '', elo: 1000, killsOnPlayer: 0, killedByPlayer: 0,
     // Behavioral Cloning DNA traits (loaded from KV for ghosts, or default for bots):
-    // FIX RATIONALE [RULE-11]: Added player-learned `maxHuntTrail`, `maxHomeIdle`, and `lateCaut`
+    // FIX RATIONALE [RULE-11]: Added player-learned 'maxHuntTrail', 'maxHomeIdle', and 'lateCaut'
     // so ghosts inherit their owner's exact hunting trail tolerance, home-exit pacing, and late-game caution.
     script: null, si: 0, sc: 0, maxTrail: 20, earlyMaxTrail: 20, lateMaxTrail: 20,
     maxHuntTrail: 6, maxHomeIdle: 10, aggr: 0.4, caut: 0.3, lateCaut: 0.3,
@@ -1303,7 +1303,7 @@ function learn(p, act){
  * relative [stepCount, relativeTurn] sequences so cloned ghosts can replay
  * the player's signature geometric loop shapes.
  * FIX RATIONALE [RULE-11]: Records whether the player's first turn turned outward
- * away from home (`away`) and pushes the final return leg `[p.tc, 0]` when closing
+ * away from home ('away') and pushes the final return leg '[p.tc, 0]' when closing
  * the loop so ghosts complete the full rectangular shape rather than cutting short.
  */
 function tripTrack(p, rel){
@@ -1546,9 +1546,9 @@ function safestOwn(e){
 /**
  * Samples a recorded player loop template (e.trips) weighted proportionally to
  * the actual enclosed cell gain (g) achieved by the player in that round and
- * matching wall-proximity context (nearWall), returning `{ s, away }`.
+ * matching wall-proximity context (nearWall), returning '{ s, away }'.
  * FIX RATIONALE [RULE-11]: Previously gave 0-cell accidental border slips the same
- * sampling weight as 300-cell rectangular loops. Weighting by `(1 + Math.sqrt(g))`
+ * sampling weight as 300-cell rectangular loops. Weighting by '(1 + Math.sqrt(g))'
  * reflects the player's actual loop distribution (small if player only made small loops;
  * substantial if player regularly closed large rectangles) without hardcoded thresholds.
  */
@@ -1604,9 +1604,9 @@ function hunt(e){
  * Frontier-aware expansion goal selector.
  * FIX RATIONALE [RULE-11]: Previously sampled only 80 global random cells up to 48
  * tiles away, causing ghosts holding 15-75% territory to spend 35+ ticks walking inside
- * their own interior (`[LONG-IDLE]`). Now scans nearby frontier cells within 18 tiles
- * of `(e.x, e.y)` plus global candidates, preferring unowned frontier tiles adjacent
- * (`adjOwn`) to `e`'s border while scoring by `e.wallPref` and `e.stealPref`.
+ * their own interior ([LONG-IDLE]). Now scans nearby frontier cells within 18 tiles
+ * of '(e.x, e.y)' plus global candidates, preferring unowned frontier tiles adjacent
+ * ('adjOwn') to 'e's border while scoring by 'e.wallPref' and 'e.stealPref'.
  */
 function pickGoal(e){
   var best = -1, bestScore = -1e9;
@@ -1748,7 +1748,7 @@ function effectiveMaxTrail(e){
  *      awareness-scaled threat horizon, and lateCaut when holding >= 30% land).
  *   2. Gates hunt() behind player-learned maxHuntTrail so ghosts never abandon
  *      long retreats to hunt unless their human owner actually hunted with long trails.
- *   3. Mirrors outward trip turns when `tplAway === 1` so replayed loops expand
+ *   3. Mirrors outward trip turns when 'tplAway === 1' so replayed loops expand
  *      into open space rather than folding back onto the ghost's own border.
  *   4. Scores all 4 candidate directions (including 180° U-turns) via scoreMove().
  */
@@ -1770,8 +1770,8 @@ function ghostDecide(e){
     var safeHome = safestOwn(e);
     var hd = safeHome >= 0 ? (Math.abs((safeHome % W) - e.x) + Math.abs(((safeHome / W) | 0) - e.y)) : 0;
     // FIX RATIONALE [RULE-11]: Scale threat-detection radius by player-observed awareness
-    // (`4 + aw * 8` = 5..12 tiles) and compare against return distance (`hd + 2`) using
-    // `activeCaut` so attentive players' ghosts retreat in time even at 50%+ land, while
+    // ('4 + aw * 8' = 5..12 tiles) and compare against return distance ('hd + 2') using
+    // 'activeCaut' so attentive players' ghosts retreat in time even at 50%+ land, while
     // oblivious/reckless players' ghosts still overextend just like their owners.
     var threatRadius = Math.round(4 + aw * 8);
     if (len > curMaxTrail) e.ret = true;
@@ -1780,7 +1780,7 @@ function ghostDecide(e){
   }
 
   // FIX RATIONALE [RULE-11]: Only allow hunt() when exposed trail length is within the
-  // player's observed `maxHuntTrail`, preventing ghosts from abandoning 35-80 tile retreats
+  // player's observed 'maxHuntTrail', preventing ghosts from abandoning 35-80 tile retreats
   // to chase enemies unless their human owner actually hunted with long trails.
   var maxHuntLen = e.maxHuntTrail != null ? e.maxHuntTrail : Math.max(4, Math.round((1 - e.caut) * curMaxTrail * 0.8 + e.aggr * 6));
   h = (len <= maxHuntLen) ? hunt(e) : -1;
@@ -1810,7 +1810,7 @@ function ghostDecide(e){
           e.tplAway = picked.away;
           e.tplMirror = false;
           // FIX RATIONALE [RULE-11]: If the player's recorded loop turned outward away from
-          // home (`tplAway === 1`), mirror left/right turns when needed so the ghost's first
+          // home ('tplAway === 1'), mirror left/right turns when needed so the ghost's first
           // turn also steers outward rather than folding back onto its own territory.
           if (e.tplAway === 1 && e.tpl.length && e.tpl[0][1] > 0){
             var firstRel = e.tpl[0][1];
@@ -2582,7 +2582,7 @@ function endRound(reason){
 
   // Compute Style DNA ratios + early/late trail limits + tactical awareness from this single round
   // FIX RATIONALE [RULE-10] & [RULE-11]: Allows aggr and caut to drop down to 0.05 for genuinely
-  // passive or reckless players, and computes `lateCaut`, `maxHuntTrail`, and `maxHomeIdle`
+  // passive or reckless players, and computes 'lateCaut', 'maxHuntTrail', and 'maxHomeIdle'
   // directly from observed player behavior in this round rather than fixed universal rules.
   var tl = trips.slice().sort(function(a, b){ return a - b; });
   var cs = player.chT + player.chA;
